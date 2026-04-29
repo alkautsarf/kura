@@ -1,0 +1,131 @@
+# kura
+
+Terminal-native EVM wallet for the qutebrowser-first workflow. Replaces MetaMask/Rabby with a small Bun daemon, a tmux-popup approval flow, and a userscript that injects `window.ethereum` into any web dapp.
+
+```
+qutebrowser ──┐                       ┌── TUI
+              ├─ shim ──▶ kura daemon ─┤
+   Aave/      │   :8421                │── CLI
+   Uniswap/   │   (HTTPS, mkcert)      │
+   ...        │                       └── popup (tmux display-popup)
+              │
+              └─ csp-strip proxy :8422 (qb-spawned, intercepts CSP-restricted dapps)
+```
+
+## Status
+
+v0.1.0 — usable for daily browsing + signing on a single machine. macOS only. Tested live on Aave (Sepolia + mainnet) and Uniswap (Sepolia + mainnet via CSP-strip proxy). WalletConnect deferred to v0.2.
+
+## Install
+
+```sh
+brew install alkautsarf/tap/kura
+```
+
+After install, run the wizard:
+
+```sh
+kura init
+```
+
+It walks 8 steps: per-install secret, daemon autostart (launchd / qutebrowser config / manual), wallet import or generate, keychain entry, qutebrowser shim install, service-key prompts (Alchemy / HyperSync / Tenderly), chain confirmation, sanity check.
+
+## Usage
+
+```sh
+kura                  # open the TUI (portfolio + activity + send/receive/etc)
+kura daemon           # run the wallet RPC daemon (auto-started by launchd by default)
+kura proxy            # standalone CSP-strip HTTPS proxy (also spawned by qb)
+kura send 0.01 ETH 0xVitalik
+kura balance --chain 1
+kura history --chain 11155111 --limit 50
+kura connections      # list active dapp sessions
+kura audit -n 20      # off-chain event log
+kura watch            # live SSE stream of daemon events
+kura install-shim     # (re)install the qutebrowser userscript
+```
+
+## TUI keys (home view)
+
+`s` send · `r` receive (QR) · `h` history · `c` connections · `w` watch · `tab` cycle chain · `n` mainnet/testnet toggle · `g` refresh · `q` quit · `esc` back from any modal
+
+## Architecture
+
+**Daemon** (`kura daemon`): Bun.serve over HTTPS on `127.0.0.1:8421`, mkcert-issued cert, X-Kura-Key auth, 18 endpoints (`/balance`, `/portfolio`, `/history`, `/requests`, `/simulate`, `/decode`, `/risk`, ...). Spawns approval popups via `tmux display-popup -E -B`. Never holds keys in memory; reads from Keychain only when an approve fires.
+
+**CSP-strip proxy** (`kura proxy`, port 8422): tiny TLS-MITM that intercepts only the dapps that ship a restrictive `<meta http-equiv="Content-Security-Policy">` (Uniswap, OpenSea). Per-host certs signed by your mkcert root CA. Auto-spawned by qutebrowser's `config.py` on startup, dies cleanly with the browser. Daemon-independent — killing the wallet daemon does not break browsing.
+
+**TUI** (`kura`): opentui+solid renderer, multi-screen router. Subscribes to daemon SSE so events appear without polling.
+
+**Popup** (spawned by daemon): also opentui+solid. Shows decoded calldata via viem `decodeFunctionData`, simulated balance diffs from Tenderly, risk badge from a 11-rule engine. `[a]` approve / `[r]` reject / `[tab]` outcome ↔ calldata view / `[q]` cancel. Steals focus to your terminal app on spawn (osascript + macOS notification).
+
+**Qutebrowser shim** (`~/.qutebrowser/greasemonkey/kura.user.js`): announces kura via EIP-6963, masquerades as MetaMask, routes JSON-RPC through `GM.xmlHttpRequest` to the daemon. Per-install secret in `X-Kura-Key`.
+
+**Keys**: stored in macOS Keychain at `xyz.<wallet>.kura`. When `kura-signer` (Swift binary in `swift/`) is built and Touch ID is unlocked, every read is biometry-gated. Without it, the wallet falls back to plain `security` CLI (Mac password).
+
+## Chains
+
+Mainnet (tier 1, full risk + sim): Ethereum, Base, Arbitrum, BSC, Monad.
+Testnet (tier 2, minimal risk engine): Sepolia, Monad Testnet.
+
+Toggle mainnet/testnet with `n` in the TUI. Hot-load any other chain via `~/.kura/chains.toml`.
+
+## Configuration
+
+`~/.kura/config.toml`:
+
+```toml
+default_wallet = "main"
+default_chain = 1
+safe_threshold_usd = 100      # txs above this get the [REVIEW] risk badge
+daemon_port = 8421
+daemon_host = "127.0.0.1"
+proxy_enabled = true          # spawn the CSP-strip proxy alongside the daemon
+proxy_port = 8422
+proxy_domains = ["app.uniswap.org", "*.uniswap.org", "opensea.io", "*.opensea.io"]
+tenderly_account = "your-account"
+tenderly_project = "your-project"
+network_mode = "mainnet"      # "mainnet" or "testnet" — drives TUI tab cycle
+```
+
+API keys live in macOS Keychain (set during `kura init`):
+- `dev.api.alchemy / api-key` — RPC
+- `dev.api.envio / hypersync-token` — history
+- `dev.api.tenderly / access-key` — simulation
+
+## qutebrowser integration
+
+`kura init` writes the userscript to `~/.qutebrowser/greasemonkey/kura.user.js` and prints the snippet you should add to `~/.qutebrowser/config.py`:
+
+```python
+# kura csp-strip proxy: spawned with qb, dies with qb
+_kura_proxy_script = os.path.expanduser("~/Documents/kura/src/index.ts")
+_kura_proxy_port = 8422
+if os.path.exists(_kura_proxy_script) and os.path.exists(_bun) and not _is_port_alive(_kura_proxy_port):
+    subprocess.run(["bash", "-c", "pgrep -f 'bun.*src/index\\.ts proxy' | xargs kill 2>/dev/null"], capture_output=True)
+    # ... see install-shim output for the full block
+if _is_port_alive(_kura_proxy_port):
+    c.content.proxy = f'http://127.0.0.1:{_kura_proxy_port}'
+else:
+    c.content.proxy = 'system'
+```
+
+Plus the Chromium PNA disable in `c.qt.args` (see `install-shim` output) so public-origin dapps can reach `127.0.0.1` at all.
+
+## Development
+
+```sh
+git clone https://github.com/alkautsarf/kura
+cd kura
+bun install
+bun run dev           # TUI / wizard
+bun run daemon        # daemon mode
+bun run typecheck
+bun run build         # local single-binary at dist/kura
+```
+
+CI builds darwin-arm64 + linux-x64 binaries on every `v*` tag. macOS binaries get the bun --compile signature stripped and re-signed adhoc (bun's signature is rejected by macOS Tahoe's mach-o loader).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

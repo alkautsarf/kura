@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+          - os: ubuntu-latest
+            target: linux-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install
+
+      - name: Compile binary
+        run: bun build --compile --target=bun-${{ matrix.target }} src/index.ts --outfile kura-${{ matrix.target }}
+
+      # bun --compile emits a malformed code signature that macOS 26's stricter
+      # mach-o loader rejects with "code signature error 4" → SIGKILL on launch.
+      # Strip and re-sign adhoc so the binary loads on Tahoe.
+      - name: Fix bun --compile code signature (macOS)
+        if: contains(matrix.target, 'darwin')
+        run: |
+          codesign --remove-signature kura-${{ matrix.target }} || true
+          codesign --force --sign - kura-${{ matrix.target }}
+
+      - name: Create tarball
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          tar -czf kura-${TAG}-${{ matrix.target }}.tar.gz kura-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kura-${{ matrix.target }}
+          path: kura-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,42 @@
+{
+  "name": "kura",
+  "version": "0.1.0",
+  "description": "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "homepage": "https://github.com/alkautsarf/kura",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alkautsarf/kura.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alkautsarf/kura/issues"
+  },
+  "module": "src/index.ts",
+  "bin": {
+    "kura": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "daemon": "bun run src/index.ts daemon",
+    "build": "bun build --compile src/index.ts --outfile dist/kura",
+    "build:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 src/index.ts --outfile dist/kura-darwin-arm64",
+    "build:linux-x64": "bun build --compile --target=bun-linux-x64 src/index.ts --outfile dist/kura-linux-x64",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@envio-dev/hypersync-client": "^1.3.0",
+    "@opentui/core": "^0.2.0",
+    "@opentui/solid": "^0.2.0",
+    "mri": "^1.2.0",
+    "qrcode-terminal": "^0.12.0",
+    "viem": "^2.48.4"
+  }
+}

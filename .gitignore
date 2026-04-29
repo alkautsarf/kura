@@ -1,0 +1,13 @@
+CLAUDE.md
+.DS_Store
+*.log
+.kura/
+node_modules/
+dist/
+.cursor/
+.idea/
+.vscode/
+swift/.build/
+*.tar.gz
+kura-darwin-arm64
+kura-linux-x64
