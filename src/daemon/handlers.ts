@@ -32,7 +32,7 @@ function notFound(): Response {
 }
 
 export const handleHealth: JsonHandler = async () => {
-  return json({ ok: true, version: "0.1.2", ts: Date.now() });
+  return json({ ok: true, version: "0.1.3", ts: Date.now() });
 };
 
 export const handleChains: JsonHandler = async (_req, url) => {

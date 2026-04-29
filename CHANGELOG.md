@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-29
+
+### Fixed
+- Daemon survives `brew upgrade kura`. Previously the daemon process kept its `process.execPath` pointing at `/opt/homebrew/Cellar/kura/<old-version>/bin/kura`, which Homebrew deletes on upgrade. Every popup spawn then exited 127 silently, so dapp connect/sign requests got no popup. Daemon now resolves the binary lazily per spawn: if `process.execPath` is gone, it falls back to the `/opt/homebrew/bin/kura` brew symlink (which always tracks the current version), or to `/usr/local/bin/kura` for Linuxbrew.
+
+[0.1.3]: https://github.com/alkautsarf/kura/releases/tag/v0.1.3
+
 ## [0.1.2] - 2026-04-29
 
 ### Fixed
