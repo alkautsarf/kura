@@ -767,25 +767,32 @@ function restoreTerminal(): void {
     ].join("");
     process.stdout.write(disableNotifications);
 
-    // OSC color queries (foreground `\x1b]10;?\x07`, background `\x1b]11;?\x07`)
-    // that opentui sends on startup don't have a "stop" sequence: the terminal
-    // already queued the response when we asked. We need to actually wait for
-    // those bytes to arrive at our stdin before we exit, otherwise they leak
-    // to the parent shell as `^[]10;rgb:.../...^G`. Sleep ~40ms (terminals
-    // typically respond in <10ms) and then drain.
-    try { (Bun as unknown as { sleepSync?: (ms: number) => void }).sleepSync?.(40); } catch {}
-
-    if (process.stdin.isTTY && process.stdin.readable) {
-      try {
-        process.stdin.setRawMode?.(true);
-        for (let i = 0; i < 100; i++) {
+    // Terminal *response* sequences from queries opentui sent during the run
+    // (DEC 997 color-scheme `^[[?997;1n`, OSC 10/11 `^[]10;rgb:.../...^G`)
+    // accumulate in our stdin while the process is alive. If we exit without
+    // draining, they spew to the parent shell as garbage — repeating `1n997;`
+    // chunks across the user's next prompt input. The disables above stop
+    // FUTURE queries; we still need to consume what's already queued.
+    //
+    // Two-stage drain with Atomics.wait for cross-runtime synchronous sleep
+    // (Bun.sleepSync exists but its behavior under `bun build --compile`
+    // differs from `bun run`; Atomics is identical in both modes):
+    if (process.stdin.isTTY) {
+      try { process.stdin.setRawMode?.(true); } catch {}
+      const sab = new SharedArrayBuffer(4);
+      const arr = new Int32Array(sab);
+      const deadline = Date.now() + 200;
+      let consumed = true;
+      while (Date.now() < deadline && consumed) {
+        consumed = false;
+        try { Atomics.wait(arr, 0, 0, 15); } catch {}
+        for (let i = 0; i < 200; i++) {
           const chunk = (process.stdin as NodeJS.ReadStream).read?.();
-          if (!chunk) break;
+          if (chunk) consumed = true;
+          else break;
         }
-        process.stdin.setRawMode?.(false);
-      } catch {
-        // best effort, never block on stdin
       }
+      try { process.stdin.setRawMode?.(false); } catch {}
     }
 
     // Now exit the alt screen, show the cursor, reset attributes.

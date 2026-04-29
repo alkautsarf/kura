@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-29
+
+### Fixed
+- Terminal escape leak on quit (`^[[?997;1n` and OSC 10/11 color responses spewing to parent shell). Compiled binary's restoreTerminal now uses `Atomics.wait` for guaranteed synchronous sleep + a 200ms bounded drain loop that consumes terminal-response bytes from stdin in raw mode before exiting alt screen. `Bun.sleepSync` was unreliable under `bun build --compile`.
+- Daemon `/health` reports correct version `0.1.1` (was hardcoded `0.0.1` in handlers.ts).
+
+[0.1.1]: https://github.com/alkautsarf/kura/releases/tag/v0.1.1
+
 ## [0.1.0] - 2026-04-29
 
 ### Added (Apr 29 release polish)
