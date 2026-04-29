@@ -5,6 +5,7 @@ import type { PendingRequest, RiskFinding, RiskLevel, RiskResult, SimulationResu
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import { decodeCalldata } from "../core/decode.ts";
+import { restoreTerminal, attachRestoreHandlers } from "../core/terminal.ts";
 
 interface PendingDetail {
   request: PendingRequest;
@@ -340,23 +341,9 @@ export async function run(args: string[]): Promise<void> {
   const decoded = decodeArgs(data as `0x${string}`, parity.signature);
   decoded.selector = parity.selector || decoded.selector;
 
-  function restoreTerminal(): void {
-    try {
-      // Disable mouse tracking, focus tracking, alternate screen, sync mode; show cursor; reset attrs.
-      const seq = [
-        "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l", "\x1b[?1015l",
-        "\x1b[?1004l", "\x1b[?2026l", "\x1b[?1049l", "\x1b[?25h", "\x1b[0m",
-      ].join("");
-      process.stdout.write(seq);
-    } catch {
-      // best-effort
-    }
-  }
-
-  // Catch-all in case process exits via signal or unhandled error
-  process.on("exit", restoreTerminal);
-  process.on("SIGINT", () => { restoreTerminal(); process.exit(130); });
-  process.on("SIGTERM", () => { restoreTerminal(); process.exit(143); });
+  // Shared restoreTerminal lives in core/terminal.ts (handles disable +
+  // synchronous drain + alt-screen exit so OSC/DEC responses don't leak).
+  attachRestoreHandlers();
 
   let resolved = false;
   const onDecide = async (decision: "approve" | "reject") => {

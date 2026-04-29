@@ -2,7 +2,7 @@
 // kura - wallet terminal entry point
 // Routes by argv[0] subcommand to: tui (default), cli, daemon, popup, init, install-shim, audit, watch.
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 const args = process.argv.slice(2);
 const subcommand = args[0];

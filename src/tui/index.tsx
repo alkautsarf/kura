@@ -10,6 +10,7 @@ import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
 import { getKnownChain } from "../core/chains.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
+import { restoreTerminal, attachRestoreHandlers } from "../core/terminal.ts";
 
 interface ApiClient {
   base: string;
@@ -748,59 +749,7 @@ function FooterHints(props: { view: View }) {
   );
 }
 
-let restored = false;
-function restoreTerminal(): void {
-  if (restored) return;
-  restored = true;
-  try {
-    // Order matters: disable terminal *notification* modes FIRST so the terminal
-    // stops sending us async responses (e.g., DEC 997 color-scheme reports) that
-    // would otherwise arrive after we've exited and leak to the parent shell as
-    // garbage like `^[[?997;1n`.
-    const disableNotifications = [
-      "\x1b[?996l",   // light/dark mode change notifications (DEC 996/997)
-      "\x1b[?2031l",  // color scheme change notifications (newer DEC 2031)
-      "\x1b[?2048l",  // in-band resize notifications
-      "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l", "\x1b[?1015l", "\x1b[?1016l", // mouse tracking variants
-      "\x1b[?1004l",  // focus tracking
-      "\x1b[?2026l",  // synchronized output
-    ].join("");
-    process.stdout.write(disableNotifications);
-
-    // Terminal *response* sequences from queries opentui sent during the run
-    // (DEC 997 color-scheme `^[[?997;1n`, OSC 10/11 `^[]10;rgb:.../...^G`)
-    // accumulate in our stdin while the process is alive. If we exit without
-    // draining, they spew to the parent shell as garbage — repeating `1n997;`
-    // chunks across the user's next prompt input. The disables above stop
-    // FUTURE queries; we still need to consume what's already queued.
-    //
-    // Two-stage drain with Atomics.wait for cross-runtime synchronous sleep
-    // (Bun.sleepSync exists but its behavior under `bun build --compile`
-    // differs from `bun run`; Atomics is identical in both modes):
-    if (process.stdin.isTTY) {
-      try { process.stdin.setRawMode?.(true); } catch {}
-      const sab = new SharedArrayBuffer(4);
-      const arr = new Int32Array(sab);
-      const deadline = Date.now() + 200;
-      let consumed = true;
-      while (Date.now() < deadline && consumed) {
-        consumed = false;
-        try { Atomics.wait(arr, 0, 0, 15); } catch {}
-        for (let i = 0; i < 200; i++) {
-          const chunk = (process.stdin as NodeJS.ReadStream).read?.();
-          if (chunk) consumed = true;
-          else break;
-        }
-      }
-      try { process.stdin.setRawMode?.(false); } catch {}
-    }
-
-    // Now exit the alt screen, show the cursor, reset attributes.
-    process.stdout.write("\x1b[?1049l\x1b[?25h\x1b[0m");
-  } catch {
-    // best effort
-  }
-}
+// restoreTerminal lives in core/terminal.ts. Shared with popup.
 
 export async function run(): Promise<void> {
   if (!existsSync(KURA_HOME)) {
@@ -818,8 +767,6 @@ export async function run(): Promise<void> {
     }
     wallet = all[0]!;
   }
-  process.on("exit", restoreTerminal);
-  process.on("SIGINT", () => { restoreTerminal(); process.exit(130); });
-  process.on("SIGTERM", () => { restoreTerminal(); process.exit(143); });
+  attachRestoreHandlers();
   render(() => <App wallet={wallet!} initialChainId={cfg.defaultChain} initialMode={cfg.networkMode} />);
 }

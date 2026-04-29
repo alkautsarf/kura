@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-29
+
+### Fixed
+- Terminal escape leak (`^[[?997;1n` and OSC 10/11 color responses) on quit, again. v0.1.1's fix only ran one drain pass before the alt-screen exit, so any responses the terminal generated *in reply to* the alt-screen exit (or to the disable sequences themselves) escaped to the parent shell. New approach: shared `core/terminal.ts` helper does disable -> sleep 150ms -> drain -> alt-screen exit -> sleep 60ms -> drain again. Uses `fs.writeSync` for synchronous flush and `Bun.sleepSync` (verified working in compiled+ad-hoc-signed binaries) instead of `Atomics.wait`. Same helper now powers both TUI and popup teardown.
+
+[0.1.2]: https://github.com/alkautsarf/kura/releases/tag/v0.1.2
+
 ## [0.1.1] - 2026-04-29
 
 ### Fixed
