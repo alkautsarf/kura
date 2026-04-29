@@ -30,7 +30,7 @@ jobs:
       - run: bun install
 
       - name: Compile binary
-        run: bun build --compile --target=bun-${{ matrix.target }} src/index.ts --outfile kura-${{ matrix.target }}
+        run: bun build.ts bun-${{ matrix.target }} kura-${{ matrix.target }}
 
       # bun --compile emits a malformed code signature that macOS 26's stricter
       # mach-o loader rejects with "code signature error 4" → SIGKILL on launch.

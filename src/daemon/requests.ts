@@ -77,7 +77,14 @@ function entrypoint(): string {
 async function spawnPopup(id: string): Promise<void> {
   const entry = entrypoint();
   const logFile = `/tmp/kura-popup-${id.slice(0, 8)}.log`;
-  const popupCmd = `${process.execPath} --preload @opentui/solid/preload ${entry} popup ${id} 2>${logFile}`;
+  // Detect compiled-binary mode (`kura` shipped via brew) vs dev mode (`bun run`).
+  // In compiled mode the bun JSX transform already ran at build time, so no
+  // --preload is needed. The binary itself dispatches `popup <id>` directly,
+  // so the entry script path is irrelevant — argv[1] is the subcommand name.
+  const isCompiled = !process.execPath.includes("/bun") && !process.execPath.endsWith("bun");
+  const popupCmd = isCompiled
+    ? `${process.execPath} popup ${id} 2>${logFile}`
+    : `${process.execPath} --preload @opentui/solid/preload ${entry} popup ${id} 2>${logFile}`;
   // Optional override: spawn into a fixed tmux pane so a tester can drive keypresses.
   // Set KURA_POPUP_PANE=main:5 (or similar) on the daemon process.
   const targetPane = process.env.KURA_POPUP_PANE;

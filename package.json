@@ -18,11 +18,11 @@
     "kura": "./src/index.ts"
   },
   "scripts": {
-    "dev": "bun run src/index.ts",
-    "daemon": "bun run src/index.ts daemon",
-    "build": "bun build --compile src/index.ts --outfile dist/kura",
-    "build:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 src/index.ts --outfile dist/kura-darwin-arm64",
-    "build:linux-x64": "bun build --compile --target=bun-linux-x64 src/index.ts --outfile dist/kura-linux-x64",
+    "dev": "bun --preload @opentui/solid/preload run src/index.ts",
+    "daemon": "bun --preload @opentui/solid/preload run src/index.ts daemon",
+    "build": "bun build.ts",
+    "build:darwin-arm64": "bun build.ts bun-darwin-arm64 dist/kura-darwin-arm64",
+    "build:linux-x64": "bun build.ts bun-linux-x64 dist/kura-linux-x64",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
