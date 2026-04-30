@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-04-30
+
+### Fixed
+- Browser stays alive when the kura csp-strip proxy crashes. Previously, an unhandled exception in any of the proxy's I/O callbacks (e.g. `clientSocket.write` against a destroyed socket inside a `net.connect` callback) would terminate the proxy. qb still had `c.content.proxy = http://127.0.0.1:8422` set and `c.content.proxy` cannot be re-applied at runtime, so every subsequent browser request hit the dead port and the user had to restart qb. Three layered fixes:
+  - `kura proxy` is now self-supervising. The top-level process is a tiny watchdog that fork-spawns the actual proxy via `KURA_PROXY_CHILD=1` and respawns it on death with exponential backoff (1s/2s/4s/8s/16s/30s, reset to 1s after 60s clean uptime). Single binary, qb config unchanged.
+  - The proxy child installs `uncaughtException` and `unhandledRejection` handlers that log to stderr but do NOT exit. The previous behavior was Bun's default of terminating on these.
+  - `src/proxy/server.ts` wraps every socket-callback body in try/catch (CONNECT setup, tunnelDirect setup, response forwarding, plain HTTP pipe) so a destroyed socket can't escalate. Adds a 32 MiB cap on buffered HTML so a pathological upstream can't OOM the process.
+- Supervisor uses the v0.1.3 brew-symlink fallback (`resolveSelfBinary`) when respawning, so the proxy survives `brew upgrade kura` mid-flight too. Helper extracted to `src/core/self-binary.ts` and shared with the daemon.
+
+### Changed
+- `~/.qutebrowser/config.py` opens `/tmp/kura-proxy.log` in append mode with a session banner, so crash history survives qb restarts. Previously each qb start truncated the log and we lost any record of prior crashes.
+
+[0.1.4]: https://github.com/alkautsarf/kura/releases/tag/v0.1.4
+
 ## [0.1.3] - 2026-04-29
 
 ### Fixed

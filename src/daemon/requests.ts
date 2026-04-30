@@ -1,9 +1,9 @@
 import { spawn } from "bun";
-import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { PendingRequest, RiskResult, SimulationResult } from "../core/types.ts";
 import { emit } from "./events.ts";
 import { logAudit } from "../core/audit-log.ts";
+import { resolveSelfBinary, isCompiledBinary } from "../core/self-binary.ts";
 
 export type Decision = "approve" | "reject" | "timeout";
 
@@ -75,21 +75,6 @@ function entrypoint(): string {
   return resolvePath(arg);
 }
 
-// `brew upgrade kura` removes the old Cellar dir, so any daemon started before
-// the upgrade ends up with a `process.execPath` that no longer exists on disk.
-// Spawning a popup with that path then fails silently (exit 127). Resolve to
-// the brew symlink (which always tracks the current version) when the original
-// path is gone.
-function resolveSelfBinary(): string {
-  if (existsSync(process.execPath)) return process.execPath;
-  for (const fallback of ["/opt/homebrew/bin/kura", "/usr/local/bin/kura"]) {
-    if (existsSync(fallback)) return fallback;
-  }
-  throw new Error(
-    `daemon binary at ${process.execPath} no longer exists and no kura fallback found in /opt/homebrew/bin or /usr/local/bin; restart the daemon`,
-  );
-}
-
 async function spawnPopup(id: string): Promise<void> {
   const entry = entrypoint();
   const logFile = `/tmp/kura-popup-${id.slice(0, 8)}.log`;
@@ -97,9 +82,9 @@ async function spawnPopup(id: string): Promise<void> {
   // In compiled mode the bun JSX transform already ran at build time, so no
   // --preload is needed. The binary itself dispatches `popup <id>` directly,
   // so the entry script path is irrelevant — argv[1] is the subcommand name.
-  const isCompiled = !process.execPath.includes("/bun") && !process.execPath.endsWith("bun");
-  const selfBin = isCompiled ? resolveSelfBinary() : process.execPath;
-  const popupCmd = isCompiled
+  const compiled = isCompiledBinary();
+  const selfBin = compiled ? resolveSelfBinary() : process.execPath;
+  const popupCmd = compiled
     ? `${selfBin} popup ${id} 2>${logFile}`
     : `${selfBin} --preload @opentui/solid/preload ${entry} popup ${id} 2>${logFile}`;
   // Optional override: spawn into a fixed tmux pane so a tester can drive keypresses.

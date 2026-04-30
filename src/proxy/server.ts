@@ -19,6 +19,11 @@ export interface ProxyOptions {
   domains: string[];
 }
 
+function safeDestroy(s: { destroy: (err?: Error) => void } | null | undefined): void {
+  if (!s) return;
+  try { s.destroy(); } catch {}
+}
+
 function hostMatches(host: string, patterns: string[]): boolean {
   const h = host.toLowerCase();
   for (const p of patterns) {
@@ -84,6 +89,14 @@ export async function startProxy(opts: ProxyOptions): Promise<ProxyHandle> {
 
   proxy.on("connect", (req, clientStream, head) => {
     const clientSocket = clientStream as net.Socket;
+    // Without an error listener, a destroyed clientSocket re-emitting errors
+    // (e.g. EPIPE during pipe) becomes an unhandled exception and kills us.
+    clientSocket.on("error", (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ECONNRESET" && code !== "EPIPE") {
+        console.error(`[kura-proxy] client socket error: ${err.message}`);
+      }
+    });
     const target = req.url ?? "";
     const [targetHost = "", targetPortStr] = target.split(":");
     const targetPort = Number(targetPortStr) || 443;
@@ -95,19 +108,28 @@ export async function startProxy(opts: ProxyOptions): Promise<ProxyHandle> {
 
     getInnerServer(targetHost).then((inner) => {
       const upstream = net.connect(inner.port, "127.0.0.1", () => {
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: kura-proxy\r\n\r\n");
-        if (head.length > 0) upstream.write(head);
-        clientSocket.pipe(upstream);
-        upstream.pipe(clientSocket);
+        try {
+          if (clientSocket.destroyed) { safeDestroy(upstream); return; }
+          clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: kura-proxy\r\n\r\n");
+          if (head.length > 0) upstream.write(head);
+          clientSocket.pipe(upstream);
+          upstream.pipe(clientSocket);
+        } catch (err) {
+          console.error(`[kura-proxy] CONNECT setup failed for ${targetHost}: ${(err as Error).message}`);
+          safeDestroy(upstream);
+          safeDestroy(clientSocket);
+        }
       });
       upstream.on("error", (err) => {
-        console.error(`[kura-proxy] inner connect failed for ${targetHost}: ${err.message}`);
-        try { clientSocket.destroy(); } catch {}
+        if ((err as NodeJS.ErrnoException).code !== "ECONNRESET") {
+          console.error(`[kura-proxy] inner connect failed for ${targetHost}: ${err.message}`);
+        }
+        safeDestroy(clientSocket);
       });
-      clientSocket.on("error", () => { try { upstream.destroy(); } catch {} });
+      clientSocket.on("close", () => safeDestroy(upstream));
     }).catch((err) => {
       console.error(`[kura-proxy] cannot prepare inner server for ${targetHost}: ${err.message}`);
-      try { clientSocket.destroy(); } catch {}
+      safeDestroy(clientSocket);
     });
   });
 
@@ -145,13 +167,20 @@ export async function startProxy(opts: ProxyOptions): Promise<ProxyHandle> {
 
 function tunnelDirect(host: string, port: number, clientSocket: net.Socket, head: Buffer): void {
   const upstream = net.connect(port, host, () => {
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: kura-proxy\r\n\r\n");
-    if (head.length > 0) upstream.write(head);
-    clientSocket.pipe(upstream);
-    upstream.pipe(clientSocket);
+    try {
+      if (clientSocket.destroyed) { safeDestroy(upstream); return; }
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: kura-proxy\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    } catch (err) {
+      console.error(`[kura-proxy] tunnelDirect setup failed for ${host}:${port}: ${(err as Error).message}`);
+      safeDestroy(upstream);
+      safeDestroy(clientSocket);
+    }
   });
-  upstream.on("error", () => clientSocket.destroy());
-  clientSocket.on("error", () => upstream.destroy());
+  upstream.on("error", () => safeDestroy(clientSocket));
+  clientSocket.on("close", () => safeDestroy(upstream));
 }
 
 function forwardPlainHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -191,14 +220,21 @@ function forwardPlainHttp(req: http.IncomingMessage, res: http.ServerResponse): 
     upRes.pipe(res);
   });
   upstream.on("error", (err) => {
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end(`kura proxy upstream error: ${err.message}`);
-    } else {
-      res.destroy(err);
-    }
+    try {
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end(`kura proxy upstream error: ${err.message}`);
+      } else {
+        res.destroy(err);
+      }
+    } catch {}
   });
-  req.pipe(upstream);
+  try {
+    req.pipe(upstream);
+  } catch (err) {
+    console.error(`[kura-proxy] plain pipe failed: ${(err as Error).message}`);
+    safeDestroy(upstream);
+  }
 }
 
 function handleHttpsRequest(host: string, port: number, req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -229,16 +265,24 @@ function handleHttpsRequest(host: string, port: number, req: http.IncomingMessag
   upstream.on("response", (upRes) => {
     void forwardResponse(host, req.url ?? "/", upRes, res).catch((err) => {
       console.error(`[kura-proxy] forward error ${host}${req.url}: ${err.message}`);
-      if (!res.headersSent) {
-        res.writeHead(502, { "Content-Type": "text/plain" });
-        res.end(`kura proxy forward error: ${err.message}`);
-      } else {
-        res.destroy(err);
-      }
+      // res may already be destroyed by an upstream-end race; guard each step.
+      try {
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end(`kura proxy forward error: ${err.message}`);
+        } else {
+          res.destroy(err);
+        }
+      } catch {}
     });
   });
 
-  req.pipe(upstream);
+  try {
+    req.pipe(upstream);
+  } catch (err) {
+    console.error(`[kura-proxy] pipe failed ${host}${req.url}: ${(err as Error).message}`);
+    safeDestroy(upstream);
+  }
 }
 
 async function forwardResponse(
@@ -260,8 +304,26 @@ async function forwardResponse(
     return;
   }
 
+  // HTML: buffer + strip + send. Cap at 32 MiB so a hostile or pathological
+  // upstream response cannot OOM the proxy. Above the cap, fall through to
+  // pass-through (CSP unstripped, but the alternative is crashing the proxy
+  // and breaking the user's whole browser).
+  const MAX_HTML_BYTES = 32 * 1024 * 1024;
   const chunks: Buffer[] = [];
-  for await (const c of upRes) chunks.push(c as Buffer);
+  let total = 0;
+  for await (const c of upRes) {
+    const buf = c as Buffer;
+    total += buf.length;
+    if (total > MAX_HTML_BYTES) {
+      console.warn(`[kura-proxy] HTML body exceeded ${MAX_HTML_BYTES} bytes for ${host}${path}, passing through unstripped`);
+      clientRes.writeHead(upRes.statusCode ?? 200, upRes.statusMessage, stripped as http.OutgoingHttpHeaders);
+      for (const prev of chunks) clientRes.write(prev);
+      clientRes.write(buf);
+      upRes.pipe(clientRes);
+      return;
+    }
+    chunks.push(buf);
+  }
   let body: Buffer = Buffer.concat(chunks as Uint8Array[]);
   body = await decompress(body, String(upRes.headers["content-encoding"] ?? "")).catch(() => body);
 
