@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-05-01
+
+### Fixed
+- `kura --version` (and `--help`) reported the wrong version after `brew upgrade`. The CLI used a hardcoded `VERSION = "0.1.5"` constant in `src/index.ts` that was supposed to be hand-bumped per release but was missed for v0.1.6 and v0.1.7. Replaced with `import pkg from "../package.json"` so version is sourced from a single place. Daemon's `/health` endpoint also now reads from `pkg.version` instead of a hand-maintained string. Verified the JSON import survives `bun build --compile`.
+
+[0.1.8]: https://github.com/alkautsarf/kura/releases/tag/v0.1.8
+
 ## [0.1.7] - 2026-05-01
 
 ### Added

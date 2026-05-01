@@ -1,3 +1,4 @@
+import pkg from "../../package.json" with { type: "json" };
 import type { Address, PendingRequest, RequestKind } from "../core/types.ts";
 import { getConfig, listSessions, listWallets, removeSession, getWallet } from "../core/config.ts";
 import { loadAllChains, getKnownChain } from "../core/chains.ts";
@@ -32,7 +33,7 @@ function notFound(): Response {
 }
 
 export const handleHealth: JsonHandler = async () => {
-  return json({ ok: true, version: "0.1.7", ts: Date.now() });
+  return json({ ok: true, version: pkg.version, ts: Date.now() });
 };
 
 export const handleChains: JsonHandler = async (_req, url) => {
