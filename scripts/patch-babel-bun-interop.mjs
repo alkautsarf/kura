@@ -13,6 +13,15 @@ const patches = [
     find: "const debug = _debug(",
     replace: "const debug = (_debug.default || _debug)(",
   },
+  // @opentui/solid/scripts/solid-plugin.ts imports transformAsync from
+  // @babel/core; bun --compile sometimes wraps it as { default: fn } namespace
+  // object so the call `transformAsync(code, ...)` blows up with
+  // "transformAsync is not a function". Patch the call site to unwrap.
+  {
+    file: "node_modules/@opentui/solid/scripts/solid-plugin.ts",
+    find: "const transforms = await transformAsync(code, {",
+    replace: "const transforms = await (transformAsync.default || transformAsync)(code, {",
+  },
 ];
 
 let applied = 0;
