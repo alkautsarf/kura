@@ -10,6 +10,7 @@ import { fetchActivity } from "../core/history.ts";
 import { decodeCalldata } from "../core/decode.ts";
 import { describeTx, type SemanticTx } from "../core/decode-tx.ts";
 import { simulate } from "../core/sim.ts";
+import { fmtCompact } from "../core/format-amount.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
 import { tokenSecurity, addressSecurity } from "../core/goplus.ts";
 import { getClient } from "../core/rpc.ts";
@@ -292,30 +293,8 @@ function enrichedDescription(
   const out = simulation.diffs.find((d) => d.delta.startsWith("-"));
   const inn = simulation.diffs.find((d) => !d.delta.startsWith("-") && d.delta !== "0");
   if (!out || !inn) return semantic.description;
-  // Compact format: "0.0000437" not "0.000043768020360712" — Touch ID needs
-  // glanceable amounts, full precision lives in the popup overview.
-  const fmt = (raw: string, decimals: number, sigFigs = 4): string => {
-    let big = BigInt(raw);
-    const sign = big < 0n ? "-" : "";
-    if (big < 0n) big = -big;
-    const div = 10n ** BigInt(decimals);
-    const whole = big / div;
-    const frac = big % div;
-    if (whole > 0n) {
-      const wholeStr = whole.toString();
-      const remaining = Math.max(0, sigFigs - wholeStr.length);
-      if (remaining === 0) return sign + wholeStr;
-      const fracStr = frac.toString().padStart(decimals, "0").slice(0, remaining).replace(/0+$/, "");
-      return fracStr.length > 0 ? `${sign}${wholeStr}.${fracStr}` : sign + wholeStr;
-    }
-    const fracStr = frac.toString().padStart(decimals, "0");
-    const firstNonZero = fracStr.search(/[1-9]/);
-    if (firstNonZero === -1) return sign + "0";
-    const truncated = fracStr.slice(0, firstNonZero + sigFigs).replace(/0+$/, "");
-    return `${sign}0.${truncated}`;
-  };
   const venue = semantic.contract?.label ? ` on ${semantic.contract.label}` : "";
-  return `Swap ${fmt(out.delta, out.decimals)} ${out.symbol} for ~${fmt(inn.delta, inn.decimals)} ${inn.symbol}${venue}`;
+  return `Swap ${fmtCompact(out.delta, out.decimals)} ${out.symbol} for ~${fmtCompact(inn.delta, inn.decimals)} ${inn.symbol}${venue}`;
 }
 
 function mapRiskKind(kind: RequestKind, data: `0x${string}`): "send" | "swap" | "approve" | "connect" | "sign" | "switch_chain" | "batch" | "other" {
@@ -464,7 +443,7 @@ export const handleDecode: JsonHandler = async (req) => {
 };
 
 // Allowlisted RPC methods that the shim's eth_* catch-all may proxy through
-// /rpc. Read-only only — write methods (eth_sendTransaction, etc.) MUST go
+// /rpc. Read-only only , write methods (eth_sendTransaction, etc.) MUST go
 // through /requests so they hit the approval flow and signing logic. Anything
 // not on this list is rejected with -32601.
 const ALLOWED_RPC_METHODS: Set<string> = new Set([

@@ -121,6 +121,48 @@ function fmtActivityAmount(raw: string, decimals: number | undefined, symbol: st
   return `${formatted} ${symbol}`;
 }
 
+// Activity row palette: muted base for the bulk of the row, blue accent for
+// amounts + token symbols so they pop without the whole line shouting in red
+// or green. Direction signal moved to a small leading symbol instead of the
+// row color, which the user found visually noisy.
+const ROW_COLORS = {
+  text: "#a5adba",      // base text
+  amount: "#88c0d0",    // amount + symbol highlight (cyan)
+  venue: "#b48ead",     // contract label / "on Router" suffix (purple)
+  age: "#888",
+  dim: "#666",          // counter address, hash
+  outArrow: "#c87a4a",  // muted orange (was bright #ff8c66)
+  inArrow: "#88a070",   // muted green (was bright #a3be8c)
+} as const;
+
+// Split a daemon description like "Swap 0.5 USDC for 0.0002 ETH on Relay Router"
+// into typed segments so we can render amounts (cyan) and the venue suffix
+// (purple) in distinct colors while the connective verbs stay muted.
+type DescSegment = { text: string; kind: "text" | "amount" | "venue" };
+function colorizeDescription(desc: string): DescSegment[] {
+  const segments: DescSegment[] = [];
+  // First peel off " on <Venue>" / " via <Venue>" / " to <Venue>" suffix.
+  let body = desc;
+  let venueTail: string | null = null;
+  const venueMatch = /\s+(?:on|via|to|from)\s+(.+)$/.exec(desc);
+  if (venueMatch) {
+    body = desc.slice(0, venueMatch.index);
+    venueTail = venueMatch[0];
+  }
+  // Then highlight amount+symbol pairs in the body.
+  const amountRe = /(\d+(?:\.\d+)?\s+[A-Z][\w._-]*)/g;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = amountRe.exec(body)) !== null) {
+    if (m.index > lastIdx) segments.push({ text: body.slice(lastIdx, m.index), kind: "text" });
+    segments.push({ text: m[1]!, kind: "amount" });
+    lastIdx = m.index + m[1]!.length;
+  }
+  if (lastIdx < body.length) segments.push({ text: body.slice(lastIdx), kind: "text" });
+  if (venueTail) segments.push({ text: venueTail, kind: "venue" });
+  return segments;
+}
+
 function fmtAge(ts: number): string {
   if (!ts) return "?";
   const seconds = Math.floor((Date.now() - ts) / 1000);
@@ -172,6 +214,9 @@ function App(props: AppProps) {
   const [chains, setChains] = createSignal<KuraChainConfig[]>([]);
   const [wallet, setWallet] = createSignal<WalletProfile>(props.wallet);
   const [wallets, setWallets] = createSignal<WalletProfile[]>(props.walletList);
+  // Hide unverified (no-USD-price) tokens by default; user toggles with [u].
+  // Lives in App so it persists when navigating between views.
+  const [showUnverified, setShowUnverified] = createSignal(false);
   const renderer = useRenderer();
 
   // Hand the live renderer to terminal.ts so the centralized quit() (which
@@ -183,6 +228,51 @@ function App(props: AppProps) {
     setActiveRenderer(renderer ?? null);
     onCleanup(() => setActiveRenderer(null));
   });
+
+  // Subscribe to the daemon's SSE event stream so we can refresh portfolio +
+  // history within ~1s of a tx being signed, instead of waiting for the next
+  // 30s tick. Only listens for `request:resolved` with decision=approve; the
+  // 30s polling fallback still catches incoming txs the daemon doesn't know
+  // about. Falls through silently if the stream can't connect (TUI keeps
+  // working on the polling fallback alone).
+  let sseCtrl: AbortController | null = null;
+  onMount(() => {
+    void (async () => {
+      try {
+        const c = await client();
+        sseCtrl = new AbortController();
+        const resp = await fetch(`${c.base}/events?stream=1`, {
+          ...tlsOpts,
+          headers: { "X-Kura-Key": c.secret },
+          signal: sseCtrl.signal,
+        });
+        if (!resp.ok || !resp.body) return;
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() ?? "";
+          for (const block of blocks) {
+            const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+            if (!dataLine) continue;
+            try {
+              const ev = JSON.parse(dataLine.slice(6)) as { type?: string; payload?: { decision?: string } };
+              if (ev.type === "request:resolved" && ev.payload?.decision === "approve") {
+                setTick((t) => t + 1);
+              }
+            } catch { /* skip malformed */ }
+          }
+        }
+      } catch {
+        // ignore: poll fallback still works
+      }
+    })();
+  });
+  onCleanup(() => sseCtrl?.abort());
 
   const [chainList] = createResource(
     () => mode(),
@@ -295,6 +385,7 @@ function App(props: AppProps) {
       else if (key.name === "w") setView("wallets");
       else if (key.name === "e") setView("watch");
       else if (key.name === "g") setTick((t) => t + 1);
+      else if (key.name === "u") setShowUnverified((v) => !v);
       else if (key.name === "n") void toggleMode();
       else if (key.name === "tab") {
         if (key.shift) {
@@ -325,7 +416,7 @@ function App(props: AppProps) {
   const chain = () => chains().find((c) => c.id === chainId()) ?? getKnownChain(chainId());
 
   return (
-    <box flexDirection="column" padding={1} width="100%" height="100%">
+    <box flexDirection="column" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={0} width="100%" height="100%">
       <box flexDirection="row" justifyContent="space-between">
         <box flexDirection="row">
           <text attributes={1}>{`kura . ${view()}   `}</text>
@@ -334,44 +425,107 @@ function App(props: AppProps) {
         <text fg="#88c0d0">{`${fmtAddr(wallet().address)} . ${wallet().name} . ${chain()?.name ?? `chain ${chainId()}`}`}</text>
       </box>
 
-      {/* Content area takes all available vertical space so the footer below
-          stays anchored at the bottom of the box, even when content is empty
-          or still loading. */}
-      <box flexGrow={1} flexDirection="column">
-        <Show when={view() === "home"}>
-          <HomeView
-            portfolio={portfolio()}
-            history={history()}
-            chain={chain()}
-          />
-        </Show>
-        <Show when={view() === "send"}>
-          <SendModal wallet={wallet()} chainId={chainId()} chain={chain()} onDone={() => setView("home")} />
-        </Show>
-        <Show when={view() === "receive"}>
-          <ReceiveModal wallet={wallet()} chain={chain()} />
-        </Show>
-        <Show when={view() === "history"}>
-          <HistoryView items={history()?.items ?? []} chain={chain()} />
-        </Show>
-        <Show when={view() === "connections"}>
-          <ConnectionsView />
-        </Show>
-        <Show when={view() === "watch"}>
-          <WatchView />
-        </Show>
-        <Show when={view() === "wallets"}>
-          <WalletView
-            current={wallet()}
-            onSelect={(w) => setWallet(w)}
-            onListChange={(list) => setWallets(list)}
-            onClose={() => setView("home")}
-            renderer={renderer}
-          />
-        </Show>
-      </box>
+      <Show when={view() === "home"}>
+        <HomeView
+          portfolio={portfolio()}
+          history={history()}
+          chain={chain()}
+          showUnverified={showUnverified()}
+        />
+      </Show>
+      <Show when={view() === "send"}>
+        <SendModal wallet={wallet()} chainId={chainId()} chain={chain()} onDone={() => setView("home")} />
+      </Show>
+      <Show when={view() === "receive"}>
+        <ReceiveModal wallet={wallet()} chain={chain()} />
+      </Show>
+      <Show when={view() === "history"}>
+        <HistoryView items={history()?.items ?? []} chain={chain()} />
+      </Show>
+      <Show when={view() === "connections"}>
+        <ConnectionsView />
+      </Show>
+      <Show when={view() === "watch"}>
+        <WatchView />
+      </Show>
+      <Show when={view() === "wallets"}>
+        <WalletView
+          current={wallet()}
+          onSelect={(w) => setWallet(w)}
+          onListChange={(list) => setWallets(list)}
+          onClose={() => setView("home")}
+          renderer={renderer}
+        />
+      </Show>
 
+      {/* spacer pushes footer to absolute bottom of pane */}
+      <box flexGrow={1} />
       <FooterHints view={view()} />
+    </box>
+  );
+}
+
+// Single activity row with segmented colors. Reused by both HomeView and
+// HistoryView. `extras` adds optional trailing columns (block#, hash) for the
+// fuller history layout.
+function ActivityRow(props: {
+  it: ActivityItem;
+  resolved: Record<string, string | null>;
+  chain: KuraChainConfig | undefined;
+  extras?: "history";
+}) {
+  const it = props.it;
+  const counter = it.direction === "out" ? it.to : it.from;
+  const name = counter ? props.resolved[counter.toLowerCase()] : null;
+  const counterDisplay = name ?? fmtAddr(counter);
+  const arrowChar = it.direction === "out" ? "-" : it.direction === "in" ? "+" : " ";
+  const arrowColor = it.direction === "out" ? ROW_COLORS.outArrow : it.direction === "in" ? ROW_COLORS.inArrow : ROW_COLORS.dim;
+  // Build the description (or fall back for raw native/erc20 rows that the
+  // daemon couldn't enrich with semantics).
+  const description = it.description ?? (() => {
+    const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
+    const dec = it.kind === "erc20" ? it.decimals : 18;
+    return fmtActivityAmount(it.value, dec, symbol);
+  })();
+  const segments = colorizeDescription(description);
+  const dustTag = it.isDust ? "[dust] " : "";
+  // Width budgets so amount/venue colors line up across rows. Description is
+  // hard-clipped to keep one line per tx; counter and hash get fixed slots.
+  const descWidth = props.extras === "history" ? 50 : 56;
+  const fullText = dustTag + segments.map((s) => s.text).join("");
+  const truncated = fullText.length > descWidth;
+  const visible = truncated ? fullText.slice(0, descWidth - 1) + "…" : fullText.padEnd(descWidth);
+  // Re-walk segments aligned to the truncated string so colors stay correct.
+  const colored: DescSegment[] = [];
+  let cursor = 0;
+  if (dustTag) {
+    colored.push({ text: dustTag, kind: "text" });
+    cursor = dustTag.length;
+  }
+  for (const seg of segments) {
+    if (cursor >= visible.length) break;
+    const remaining = visible.length - cursor;
+    const slice = seg.text.slice(0, remaining);
+    if (slice.length > 0) colored.push({ text: slice, kind: seg.kind });
+    cursor += slice.length;
+  }
+  // Pad the colored chunks out to descWidth so the next column lines up.
+  if (cursor < descWidth) colored.push({ text: " ".repeat(descWidth - cursor), kind: "text" });
+  const segColor = (k: DescSegment["kind"]) => {
+    if (it.isDust) return ROW_COLORS.dim;
+    return k === "amount" ? ROW_COLORS.amount : k === "venue" ? ROW_COLORS.venue : ROW_COLORS.text;
+  };
+  return (
+    <box flexDirection="row">
+      <text fg={ROW_COLORS.age}>{`  ${fmtAge(it.timestamp).padEnd(5)} `}</text>
+      <text fg={arrowColor}>{`${arrowChar} `}</text>
+      <For each={colored}>
+        {(seg) => <text fg={segColor(seg.kind)}>{seg.text}</text>}
+      </For>
+      <text fg={ROW_COLORS.dim}>{`  ${counterDisplay.padEnd(props.extras === "history" ? 28 : 22).slice(0, props.extras === "history" ? 28 : 22)}`}</text>
+      <Show when={props.extras === "history"}>
+        <text fg={ROW_COLORS.dim}>{`  #${it.blockNumber.toString().padEnd(10)} ${fmtAddr(it.hash, 4)}`}</text>
+      </Show>
     </box>
   );
 }
@@ -380,9 +534,10 @@ function HomeView(props: {
   portfolio: Portfolio | null | undefined;
   history: { items: ActivityItem[] } | undefined;
   chain: KuraChainConfig | undefined;
+  showUnverified: boolean;
 }) {
   // Hide isDust spam from the home view (kura history shows them separately).
-  const items = () => (props.history?.items ?? []).filter((it) => !it.isDust).slice(0, 8);
+  const items = () => (props.history?.items ?? []).filter((it) => !it.isDust).slice(0, 12);
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
   createEffect(() => {
     const list = items();
@@ -399,9 +554,15 @@ function HomeView(props: {
       setResolved((prev) => ({ ...prev, ...next }));
     });
   });
-  // Visible portfolio: priced tokens + unverified, never spam. Counts hidden.
-  const visibleTokens = () => (props.portfolio?.tokens ?? []).filter((t) => !t.spam).slice(0, 8);
-  const hiddenCount = () => (props.portfolio?.tokens ?? []).filter((t) => t.spam).length;
+  // Visible portfolio: priced tokens always; unverified gated behind toggle;
+  // spam never shown here (only counted in the hidden line).
+  const visibleTokens = () => {
+    const all = (props.portfolio?.tokens ?? []).filter((t) => !t.spam);
+    const filtered = props.showUnverified ? all : all.filter((t) => !t.unverified);
+    return filtered.slice(0, 8);
+  };
+  const spamCount = () => (props.portfolio?.tokens ?? []).filter((t) => t.spam).length;
+  const unverifiedCount = () => (props.portfolio?.tokens ?? []).filter((t) => t.unverified && !t.spam).length;
   const dustCount = () => (props.history?.items ?? []).filter((it) => it.isDust).length;
   return (
     <box flexDirection="column">
@@ -423,8 +584,11 @@ function HomeView(props: {
                 );
               }}
             </For>
-            <Show when={hiddenCount() > 0}>
-              <text fg="#666">{`  + ${hiddenCount()} spam token${hiddenCount() === 1 ? "" : "s"} hidden`}</text>
+            <Show when={!props.showUnverified && unverifiedCount() > 0}>
+              <text fg="#666">{`  + ${unverifiedCount()} unverified token${unverifiedCount() === 1 ? "" : "s"} hidden  ([u] to show)`}</text>
+            </Show>
+            <Show when={spamCount() > 0}>
+              <text fg="#666">{`  + ${spamCount()} spam token${spamCount() === 1 ? "" : "s"} hidden`}</text>
             </Show>
           </box>
         </Show>
@@ -432,30 +596,12 @@ function HomeView(props: {
       <box marginTop={1} flexDirection="column">
         <text attributes={1}>Recent Activity</text>
         <box marginTop={1} flexDirection="column">
-          <Show when={items().length > 0} fallback={<text fg="#666">  no recent activity</text>}>
+          <Show when={items().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no recent activity</text>}>
             <For each={items()}>
-              {(it) => {
-                const arrow = it.direction === "out" ? "<-" : it.direction === "in" ? "->" : "<>";
-                const rowColor = it.direction === "out" ? "#ff8c66" : it.direction === "in" ? "#a3be8c" : "#888";
-                const counter = it.direction === "out" ? it.to : it.from;
-                const name = counter ? resolved()[counter.toLowerCase()] : null;
-                const counterDisplay = name ?? fmtAddr(counter);
-                // Decoded contract calls and ERC20 transfers with semantics
-                // get the description; raw native sends still get the
-                // arrow + amount + symbol layout.
-                const left = it.description
-                  ? it.description
-                  : (() => {
-                      const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
-                      const dec = it.kind === "erc20" ? it.decimals : 18;
-                      return `${arrow} ${fmtActivityAmount(it.value, dec, symbol)}`;
-                    })();
-                const line = `  #${it.blockNumber.toString().padEnd(10)} ${left.padEnd(48).slice(0, 48)}  ${counterDisplay}`.padEnd(110).slice(0, 110);
-                return <text fg={rowColor}>{line}</text>;
-              }}
+              {(it) => <ActivityRow it={it} resolved={resolved()} chain={props.chain} />}
             </For>
             <Show when={dustCount() > 0}>
-              <text fg="#666">{`  + ${dustCount()} dust/spam tx${dustCount() === 1 ? "" : "s"} hidden`}</text>
+              <text fg={ROW_COLORS.dim}>{`  + ${dustCount()} dust/spam tx${dustCount() === 1 ? "" : "s"} hidden`}</text>
             </Show>
           </Show>
         </box>
@@ -636,39 +782,23 @@ function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | un
       setResolved((prev) => ({ ...prev, ...next }));
     });
   });
-  // Cap rendered rows. opentui-solid (0.2.0) corrupts cells when many mutating
-  // rows re-render under <For>; capping to ~15 keeps the visual stable.
-  // Full feed available via `kura history` CLI which has no opentui.
-  const MAX_ROWS = 15;
+  // Cap rendered rows to fit typical terminal heights (36 lines minus
+  // header/footer leaves ~30 usable). The previous tighter cap of 15 was a
+  // defensive workaround for an old opentui-solid render bug; bumped now that
+  // the underlying issue has settled. Use `kura history` CLI for >50 items.
+  const MAX_ROWS = 50;
   const visible = () => props.items.slice(0, MAX_ROWS);
   const overflow = () => Math.max(0, props.items.length - MAX_ROWS);
   return (
     <box marginTop={1} flexDirection="column">
       <text attributes={1}>history</text>
       <box marginTop={1} flexDirection="column">
-        <Show when={visible().length > 0} fallback={<text fg="#666">  no activity</text>}>
+        <Show when={visible().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no activity</text>}>
           <For each={visible()}>
-            {(it) => {
-              const arrow = it.direction === "out" ? "<-" : it.direction === "in" ? "->" : "<>";
-              const baseColor = it.direction === "out" ? "#ff8c66" : it.direction === "in" ? "#a3be8c" : "#888";
-              const rowColor = it.isDust ? "#666" : baseColor;
-              const counter = it.direction === "out" ? it.to : it.from;
-              const name = counter ? resolved()[counter.toLowerCase()] : null;
-              const counterDisplay = name ?? fmtAddr(counter);
-              const left = it.description
-                ? `${it.isDust ? "[dust] " : ""}${it.description}`
-                : (() => {
-                    const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
-                    const dec = it.kind === "erc20" ? it.decimals : 18;
-                    const tag = it.isDust ? "[dust] " : "";
-                    return `${tag}${arrow} ${fmtActivityAmount(it.value, dec, symbol)}`;
-                  })();
-              const line = `  #${it.blockNumber.toString().padEnd(10)} ${left.padEnd(48).slice(0, 48)}  ${counterDisplay.padEnd(28).slice(0, 28)}  ${fmtAddr(it.hash, 4)}`.padEnd(130).slice(0, 130);
-              return <text fg={rowColor}>{line}</text>;
-            }}
+            {(it) => <ActivityRow it={it} resolved={resolved()} chain={props.chain} extras="history" />}
           </For>
           <Show when={overflow() > 0}>
-            <text fg="#666">{`  +${overflow()} more  ·  use \`kura history\` CLI for full feed`}</text>
+            <text fg={ROW_COLORS.dim}>{`  +${overflow()} more  ·  use \`kura history\` CLI for full feed`}</text>
           </Show>
         </Show>
       </box>
@@ -1226,7 +1356,7 @@ function FooterHints(props: { view: View }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [g] refresh  [q] quit";
+        return "[s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [u] unverified  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
@@ -1242,7 +1372,7 @@ function FooterHints(props: { view: View }) {
     }
   };
   return (
-    <box marginTop={1} flexDirection="row">
+    <box flexDirection="row">
       <text fg="#888">{hint()}</text>
     </box>
   );

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.17] - 2026-05-01
+
+### Added
+- TUI Recent Activity now shows row age (`12m`, `1h`, `4h`, etc.) instead of just block number. `src/core/history.ts` extends the HyperSync request body with `field_selection.block: ["number", "timestamp"]`, builds a per-block timestamp map, and threads it onto every `ActivityItem`. HomeView and HistoryView both render via the new shared `ActivityRow` component using the local `fmtAge` helper.
+- HyperSync pagination via `next_block` cursor (up to 12 pages). Universal Router swaps emit hundreds of internal Transfer logs that fill HyperSync's per-response cap before all user txs are returned, so a single query was capped at the oldest 6 txs even when the wallet had 12+. Now follows pagination until the window is exhausted or `MAX_PAGES` is hit.
+- TUI `[u]` keystroke toggles unverified tokens (no-USD-price ERC20s) in HomeView. Hidden by default with `+ N unverified tokens hidden ([u] to show)` line; toggle persists across view switches via signal in `App`.
+- TUI subscribes to daemon SSE stream (`/events?stream=1`) and bumps the refresh tick on `request:resolved` events with `decision === "approve"`. Reduces "I just signed a tx, where's it on screen?" lag from up to 30s (poll interval) to ~1s.
+- New shared `fmtCompact` helper in `src/core/format-amount.ts` (4-sig-fig truncation, sign-safe BigInt math). Replaces the inline 20-line `fmt` in `src/daemon/handlers.ts:enrichedDescription` and is reused by the new history enrichment.
+- New `priceByAddressBatch(chainId, addresses[])` in `src/core/prices.ts` sends up to 25 addresses per Alchemy request (chunked) and de-dupes against the cache. Replaces the per-token call sites in `src/core/portfolio.ts` and `src/core/history.ts`. Negative results (no USD price) now cached too with a 30-min TTL so spam-token detection doesn't re-hammer Alchemy on every refresh.
+- `src/core/history.ts:groupAndEnrich` consolidates outgoing contract+ERC20 log rows into one row per swap. For Uniswap V4 / Relay / 1inch style swaps where the receipt is via internal call (no Transfer log), queries the user's native balance at `blockN` vs `blockN-1` to recover the receipt amount and produces e.g. `Swap 0.5 USDC for 0.0002153 ETH on Relay Router`. Per-row balance-diff RPCs run via `Promise.all` so multiple swaps in the same fetch don't serialize. Token meta is pre-fetched into `metaByToken` so the `fmtSide` helper is sync (no double lookup).
+
+### Fixed
+- TUI footer keys (`[s] send [r] receive ...`) now anchor to the absolute bottom of the pane instead of floating one line below the content. Switched outer box from `padding={1}` to `paddingLeft/Right/Top={1} paddingBottom={0}` and added an explicit `<box flexGrow={1} />` spacer between content and `FooterHints` (matching the popup's existing pattern at `src/popup/index.tsx:361`).
+- TUI HistoryView previously capped at 15 rows with a "+5 more, use kura history CLI" footer because of an old opentui-solid render bug. Bumped to 50 rows after verifying the underlying issue has settled.
+- Description for outgoing contract calls no longer overwrites specific descriptions like `Approve unlimited USDC to Permit2` with a generic balance-diff summary. New `it.semanticKind` field on `ActivityItem` lets `groupAndEnrich` skip enrichment when `describeTx` already produced a specific description (`approve`/`transfer`/`swap`/`permit`/etc), but still drops orphan ERC20 log rows from the same tx so users don't see "Approve 0.5 USDC to Relay Router" + a duplicate raw transfer row.
+- Router-labeled venues (`Relay Router`, `Uniswap V4 Universal Router`, etc.) get verb `Swap` instead of `Send` even when only one side of the trade is visible in logs. `isRouterVenue` heuristic in `groupAndEnrich` matches `/router|swap|aggregator/i` against `getContractLabel`'s output.
+- V4 hook scam tokens (Transfer events with absurd values like `7.8e300` to spoof the IN side of a swap) are filtered upfront: any Transfer log with raw value > 10^36 is dropped in `fetchActivity`. `groupAndEnrich` also prefers tokens with known metadata when picking OUT/IN sides so a junk hook token can't outrank USDC.
+- Spam token receives (BFS, BTCFORUMS, etc. that escaped Alchemy's spam list) now flagged as dust via three layered heuristics: Alchemy spam list, `from === token` self-mint pattern, and incoming ERC20 with no USD price.
+
+### Changed
+- TUI activity row colors split into segments instead of a single color per row. Row text is muted gray-blue, amounts and token symbols (e.g. `0.5 USDC`) are cyan, venue suffix (`on Uniswap V4 Universal Router`) is purple, counter address and tx hash are dim. Direction indicator collapsed to a tiny `-` (muted orange) for outgoing or `+` (muted green) for incoming. Replaces the prior whole-row red/green coloring.
+- HyperSync default lookback widened from `head - 200_000` to `head - 5_000_000` blocks (~6 months on Base). Combined with pagination this captures the typical user's full recent history without forcing them to use `kura history` CLI.
+
+[0.1.17]: https://github.com/alkautsarf/kura/releases/tag/v0.1.17
+
 ## [0.1.16] - 2026-05-01
 
 ### Fixed

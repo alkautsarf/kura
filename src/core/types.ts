@@ -135,6 +135,10 @@ export interface ActivityItem {
   // True when the row is filtered out by spam/dust heuristics. Kept on the
   // item so callers can opt-in to showing them (e.g., `kura history --all`).
   isDust?: boolean;
+  // Output of describeTx for contract calls; used by groupAndEnrich to know
+  // whether the existing description is already specific (transfer/approve/etc)
+  // and shouldn't be overwritten with a generic balance-diff summary.
+  semanticKind?: "native_send" | "approve" | "transfer" | "transferFrom" | "swap" | "permit" | "permit2" | "deposit" | "withdraw" | "execute" | "multicall" | "contract" | "unknown";
 }
 
 

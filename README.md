@@ -52,7 +52,7 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 ## TUI keys (home view)
 
-`s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `g` refresh · `q` quit · `esc` back from any modal
+`s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
 
 ## Architecture
 
