@@ -1,6 +1,6 @@
 {
   "name": "kura",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces.",
   "type": "module",
   "private": true,
@@ -23,7 +23,8 @@
     "build": "bun build.ts",
     "build:darwin-arm64": "bun build.ts bun-darwin-arm64 dist/kura-darwin-arm64",
     "build:linux-x64": "bun build.ts bun-linux-x64 dist/kura-linux-x64",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/patch-babel-bun-interop.mjs"
   },
   "devDependencies": {
     "@types/bun": "latest"

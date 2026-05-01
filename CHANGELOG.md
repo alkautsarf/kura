@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-05-01
+
+### Fixed
+- Recurring `_debug is not a function` (or `transformAsync is not a function`) bun-compile build failures killed v0.1.6, v0.1.7, v0.1.11, and v0.1.12 attempts on Linux CI. Root cause: `bun --compile`'s CJS interop is non-deterministic for `@babel/traverse → debug` and similar default-export-as-namespace edge cases. Same bun version + same lockfile + same source can succeed one run and fail the next. Fix: postinstall script `scripts/patch-babel-bun-interop.mjs` rewrites the offending `const debug = _debug(...)` to `const debug = (_debug.default || _debug)(...)` so the call works regardless of whether bun wraps the import as a namespace object. Patch is idempotent (no-op if already applied) and runs after every `bun install`. Categorical fix replaces the per-version Bun pinning bandaid.
+- CI also passes `--frozen-lockfile` to `bun install` to prevent any silent dependency drift.
+
+[0.1.13]: https://github.com/alkautsarf/kura/releases/tag/v0.1.13
+
 ## [0.1.12] - 2026-05-01
+
+### Changed
+- (aborted release — same Linux babel/_debug build failure as v0.1.11; ship via v0.1.13 with categorical postinstall patch)
+
+[0.1.12]: https://github.com/alkautsarf/kura/releases/tag/v0.1.12
 
 ### Changed
 - Release marker only; no functional change. Exercises the new `brew services` auto-restart-on-upgrade pipeline introduced in the v0.1.10_1 formula bump. v0.1.11 was tagged but never built — splitting the App's outer `padding={1}` into per-side `paddingTop`/`paddingLeft`/`paddingRight` to drop the bottom padding triggered a latent bun bundler / `@babel/traverse` CJS interop bug (same family as the v0.1.6 `_debug is not a function` and v0.1.7 babel regressions). Reverted the JSX prop shape; cosmetic footer-flush ask is deferred until the underlying babel/bun interop is patched (likely a postinstall script in a future release).
