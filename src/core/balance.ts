@@ -76,26 +76,20 @@ export async function tokenBalances(chainId: number, address: Address): Promise<
   });
   const top = nonZero.slice(0, MAX_TOKENS_WITH_METADATA);
   const tail = nonZero.slice(MAX_TOKENS_WITH_METADATA);
-  const out: PortfolioToken[] = [];
-  const concurrency = 3;
-  for (let i = 0; i < top.length; i += concurrency) {
-    const batch = top.slice(i, i + concurrency);
-    const metas = await Promise.all(
-      batch.map((b) =>
-        alchemyRpc<AlchemyMetadata>(chainId, "alchemy_getTokenMetadata", [b.contractAddress]).catch(() => ({} as AlchemyMetadata)),
-      ),
-    );
-    for (let j = 0; j < batch.length; j++) {
-      const b = batch[j]!;
-      const m = metas[j]!;
-      out.push({
-        token: b.contractAddress as Address,
-        symbol: m.symbol ?? "?",
-        decimals: m.decimals ?? 18,
-        balance: BigInt(b.tokenBalance).toString(),
-      });
-    }
-  }
+  const metas = await Promise.all(
+    top.map((b) =>
+      alchemyRpc<AlchemyMetadata>(chainId, "alchemy_getTokenMetadata", [b.contractAddress]).catch(() => ({} as AlchemyMetadata)),
+    ),
+  );
+  const out: PortfolioToken[] = top.map((b, i) => {
+    const m = metas[i]!;
+    return {
+      token: b.contractAddress as Address,
+      symbol: m.symbol ?? "?",
+      decimals: m.decimals ?? 18,
+      balance: BigInt(b.tokenBalance).toString(),
+    };
+  });
   for (const b of tail) {
     out.push({ token: b.contractAddress as Address, symbol: "?", decimals: 18, balance: BigInt(b.tokenBalance).toString() });
   }

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.18] - 2026-05-02
+
+### Added
+- Activity detail view. Pressing `[enter]` on a selected activity row in HomeView or HistoryView opens a transaction detail modal showing hash, chain, block, age (relative + absolute), status (success/failed via `eth_getTransactionReceipt`), nonce, from/to with ENS/Basename resolution + contract label, function signature + selector (via new `/describe-tx` daemon endpoint that wraps `describeTx` from `core/decode-tx.ts`), the full enriched description, and gas line (units · gwei · ETH cost · USD). Two parallel `eth_getTransactionReceipt` + `eth_getTransactionByHash` calls go through the existing `/rpc` daemon proxy.
+- Tx detail data sub-view: `[tab]` toggles into a full-calldata view that wraps bytes to 76-char lines with j/k scrolling and `[c]` to copy raw bytes to clipboard. Footer hints update per sub-view. Mode resets to overview when you change which tx you're inspecting.
+- Tx detail keys: overview gets `[c]` copy hash, `[o]` open explorer, `[tab]` data, `[esc]` back; data gets `[j/k]` scroll, `[c]` copy bytes, `[o]` open explorer, `[tab]` back to overview, `[esc]` back.
+- `[o]` open explorer prefers qutebrowser over the system default browser (typically Chrome on user machines). Detection order: `Bun.which("qutebrowser")` → `~/Library/Python/3.{14,13,12}/bin/qutebrowser` → Homebrew prefix. Falls back to `open <url>` if none found.
+- Vim-style `j` / `k` (and `down` / `up`) cursor navigation on activity rows in HomeView and HistoryView. Selected row gets a `>` prefix and the age column brightens to cyan. Cursor resets when view, wallet, or chain changes.
+- `[y]` keybind on home view copies the active wallet address to the macOS clipboard via `pbcopy`. Transient `copied 0xABCD…1234` toast appears for 2s. Implementation extracted from `src/popup/index.tsx` into a shared `src/core/clipboard.ts` so both surfaces use the same helper.
+- Daemon-side response cache for `/portfolio` and `/activity` (15s TTL, 60s stale-window). Activity additionally uses HyperSync `archive_height` as a fast-path: if the stale window is hit but no new blocks have landed since the last fetch, the cache is refreshed without paginating. Both caches are invalidated when SSE emits `request:resolved` with `decision === "approve"` so a freshly-signed tx surfaces on the next TUI tick. Manual `[g]` refresh sends `?fresh=1` to bypass.
+- `getTokenMeta` now de-dupes concurrent in-flight requests via a `Map<key, Promise>` so multiple activity rows referencing the same ERC20 share one Alchemy/on-chain lookup. Pre-warm pass in `fetchActivity` fires `Promise.all` for every distinct token address before per-item enrichment runs.
+
+### Changed
+- Header refresh. Removed the `view()` segment from the left so it just reads `kura`. Mode indicator moved to the right, lowercased, no brackets: `mainnet` (green) / `testnet` (amber). Right cluster now segmented: address in cyan, separators dim, wallet/chain default, mode semantic. Outer box `paddingTop` dropped from 1 to 0 so the header sits flush at the top.
+- Activity rows now have `marginBottom={1}` for vertical breathing room between txs. HomeView cap reduced from 12 to 10 rows so the spaced-out list still fits on a 36-row terminal alongside the portfolio.
+- Portfolio token rows split symbol from amount/USD/% so the symbol can render in cyan (matches the activity amount palette and signals "this is the token identity") while the rest stays default.
+- Cold portfolio load is ~600-800ms faster: ERC20 metadata for the top 30 tokens now fires as a single `Promise.all` instead of a sliding-window `for` loop with concurrency 3. Native price `priceBySymbol` moved into the outer `Promise.all` instead of awaiting serially after balance + spam list.
+- Description: bumped from "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces." to "EVM terminal wallet."
+- Background tick interval is gated to home + history views so navigating to wallets/connections/etc no longer fires HyperSync + Alchemy fetches the user can't see.
+
+[0.1.18]: https://github.com/alkautsarf/kura/releases/tag/v0.1.18
+
 ## [0.1.17] - 2026-05-01
 
 ### Added

@@ -52,7 +52,9 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 ## TUI keys (home view)
 
-`s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
+`j`/`k` move cursor on activity rows · `enter` open tx detail · `y` copy wallet address · `s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
+
+In the tx detail view: `c` copies the hash · `o` opens the explorer · `esc` returns.
 
 ## Architecture
 

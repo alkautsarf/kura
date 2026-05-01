@@ -54,9 +54,11 @@ async function getToken(): Promise<string> {
   return cachedToken;
 }
 
-async function archiveHead(baseUrl: string): Promise<number> {
+export async function archiveHead(baseUrl: string): Promise<number> {
   try {
-    const resp = await fetch(`${baseUrl}/height`);
+    // 2s cap so the daemon's stale-cache fast-path can't dangle if HyperSync
+    // hangs , the whole point is to be cheaper than re-paginating.
+    const resp = await fetch(`${baseUrl}/height`, { signal: AbortSignal.timeout(2000) });
     if (!resp.ok) return 0;
     const j = (await resp.json()) as { height?: number };
     return j.height ?? 0;
@@ -218,6 +220,17 @@ export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
   // can show "approve USDC -> Permit2" instead of "0 ETH" / "tok". Capped to
   // avoid blowing latency on long histories , anything beyond N renders raw.
   const sliced = items.slice(0, limit);
+  // Pre-warm token metadata cache for every distinct ERC20 we'll touch in
+  // either enrichItems or groupAndEnrich. With the in-flight dedupe in
+  // getTokenMeta, this collapses N concurrent identical RPCs into one.
+  const tokenSet = new Set<string>();
+  for (const it of sliced) {
+    if (it.kind === "erc20" && it.token) tokenSet.add(it.token.toLowerCase());
+  }
+  for (const log of logs) {
+    if (log.address) tokenSet.add(log.address.toLowerCase());
+  }
+  await Promise.all([...tokenSet].map((t) => getTokenMeta(q.chainId, t as Address).catch(() => null)));
   await enrichItems(q.chainId, sliced, txs);
   // Final pass: fold ERC20 log rows into outgoing contract rows so the user
   // sees one consolidated "Swap X for Y on Router" line instead of contract +

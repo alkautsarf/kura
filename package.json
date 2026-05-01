@@ -1,7 +1,7 @@
 {
   "name": "kura",
-  "version": "0.1.17",
-  "description": "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces.",
+  "version": "0.1.18",
+  "description": "EVM terminal wallet.",
   "type": "module",
   "private": true,
   "license": "MIT",

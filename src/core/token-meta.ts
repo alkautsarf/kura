@@ -13,6 +13,7 @@ export interface TokenMeta {
 
 const NATIVE_PLACEHOLDER = "0x0000000000000000000000000000000000000000";
 const META_CACHE = new Map<string, TokenMeta | null>();
+const META_INFLIGHT = new Map<string, Promise<TokenMeta | null>>();
 
 export async function getTokenMeta(
   chainId: number,
@@ -25,9 +26,19 @@ export async function getTokenMeta(
   }
   const key = `${chainId}:${address.toLowerCase()}`;
   if (META_CACHE.has(key)) return META_CACHE.get(key)!;
-  const result = (await alchemyMeta(chainId, address)) ?? (await onchainMeta(chainId, address));
-  META_CACHE.set(key, result);
-  return result;
+  const inflight = META_INFLIGHT.get(key);
+  if (inflight) return inflight;
+  const promise = (async () => {
+    try {
+      const result = (await alchemyMeta(chainId, address)) ?? (await onchainMeta(chainId, address));
+      META_CACHE.set(key, result);
+      return result;
+    } finally {
+      META_INFLIGHT.delete(key);
+    }
+  })();
+  META_INFLIGHT.set(key, promise);
+  return promise;
 }
 
 async function alchemyMeta(chainId: number, address: Address): Promise<TokenMeta | null> {

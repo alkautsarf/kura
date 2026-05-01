@@ -7,12 +7,12 @@ import { priceByAddressBatch, priceBySymbol } from "./prices.ts";
 export async function buildPortfolio(walletName: string, chainId: number, address: Address): Promise<Portfolio> {
   const chain = getKnownChain(chainId);
   if (!chain) throw new Error(`unknown chain ${chainId}`);
-  const [nativeBal, tokens, spam] = await Promise.all([
+  const [nativeBal, tokens, spam, nativePrice] = await Promise.all([
     nativeBalance(chainId, address),
     tokenBalances(chainId, address).catch(() => [] as PortfolioToken[]),
     getSpamContracts(chainId),
+    priceBySymbol(chain.symbol),
   ]);
-  const nativePrice = await priceBySymbol(chain.symbol);
   const native: PortfolioToken = {
     token: "native",
     symbol: chain.symbol,

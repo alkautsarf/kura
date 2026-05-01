@@ -3,10 +3,10 @@ import type { Address, PendingRequest, RequestKind } from "../core/types.ts";
 import { getConfig, listSessions, listWallets, removeSession, getWallet } from "../core/config.ts";
 import { loadAllChains, getKnownChain } from "../core/chains.ts";
 import { decide, enqueue, enrich, get, list as listPending } from "./requests.ts";
-import { recentEvents, sseStream } from "./events.ts";
+import { recentEvents, sseStream, subscribe } from "./events.ts";
 import { readAudit } from "../core/audit-log.ts";
 import { buildPortfolio } from "../core/portfolio.ts";
-import { fetchActivity } from "../core/history.ts";
+import { fetchActivity, archiveHead } from "../core/history.ts";
 import { decodeCalldata } from "../core/decode.ts";
 import { describeTx, type SemanticTx } from "../core/decode-tx.ts";
 import { simulate } from "../core/sim.ts";
@@ -362,13 +362,42 @@ export const handleBalance: JsonHandler = async (_req, url) => {
   return json({ chainId, address, balance: balance.toString() });
 };
 
+// In-memory response cache for the read-heavy /portfolio + /activity routes.
+// Both endpoints aggregate multi-step Alchemy + HyperSync work that costs
+// ~1-3s on a cold call. The TUI refetches every 30s plus on every chain/wallet
+// switch, so without a cache the user pays the full latency on every tick.
+// Invalidation: any approved tx clears both caches (SSE wakeup below). Manual
+// [g] refresh in the TUI sends ?fresh=1 to bypass.
+const TTL_MS = 15_000;
+const STALE_MS = 60_000;
+interface PortfolioCacheEntry { data: unknown; ts: number; }
+interface ActivityCacheEntry { items: unknown; ts: number; archiveHeight: number; }
+const portfolioCache = new Map<string, PortfolioCacheEntry>();
+const activityCache = new Map<string, ActivityCacheEntry>();
+
+subscribe((event) => {
+  // Any tx the user just signed will change balances + activity. Clear both
+  // caches so the next read returns fresh data within ~1s of the signature.
+  if (event.type === "request:resolved" && event.payload.decision === "approve") {
+    portfolioCache.clear();
+    activityCache.clear();
+  }
+});
+
 export const handlePortfolio: JsonHandler = async (_req, url) => {
   const cfg = await getConfig();
   const chainId = Number(url.searchParams.get("chain") ?? cfg.defaultChain);
   const wallet = url.searchParams.get("wallet") ?? cfg.defaultWallet;
   const address = await resolveAddress(url.searchParams.get("address") ?? wallet);
   if (!chainId || !address) return badRequest("chain and address/wallet required");
+  const fresh = url.searchParams.get("fresh") === "1";
+  const key = `${chainId}:${address.toLowerCase()}:${wallet}`;
+  if (!fresh) {
+    const cached = portfolioCache.get(key);
+    if (cached && Date.now() - cached.ts < TTL_MS) return json(cached.data);
+  }
   const portfolio = await buildPortfolio(wallet, chainId, address);
+  portfolioCache.set(key, { data: portfolio, ts: Date.now() });
   return json(portfolio);
 };
 
@@ -379,7 +408,30 @@ export const handleHistory: JsonHandler = async (_req, url) => {
   const address = await resolveAddress(url.searchParams.get("address") ?? wallet);
   if (!chainId || !address) return badRequest("chain and address/wallet required");
   const limit = Number(url.searchParams.get("limit") ?? "25");
+  const fresh = url.searchParams.get("fresh") === "1";
+  const key = `${chainId}:${address.toLowerCase()}:${limit}`;
+  if (!fresh) {
+    const cached = activityCache.get(key);
+    const age = cached ? Date.now() - cached.ts : Infinity;
+    if (cached && age < TTL_MS) return json({ items: cached.items });
+    if (cached && age < STALE_MS) {
+      // Stale but recent. One cheap GET /height tells us if anything new even
+      // landed; if not, refresh ts and return the cached items rather than
+      // paying the full pagination cost.
+      const chain = getKnownChain(chainId);
+      if (chain?.hyperSyncUrl) {
+        const head = await archiveHead(chain.hyperSyncUrl);
+        if (head > 0 && head === cached.archiveHeight) {
+          cached.ts = Date.now();
+          return json({ items: cached.items });
+        }
+      }
+    }
+  }
   const items = await fetchActivity({ chainId, address, limit });
+  const chain = getKnownChain(chainId);
+  const head = chain?.hyperSyncUrl ? await archiveHead(chain.hyperSyncUrl) : 0;
+  activityCache.set(key, { items, ts: Date.now(), archiveHeight: head });
   return json({ items });
 };
 
@@ -440,6 +492,31 @@ export const handleDecode: JsonHandler = async (req) => {
   }
   const decoded = await decodeCalldata(body.to, body.data);
   return json(decoded);
+};
+
+interface DescribeReq {
+  chainId: number;
+  to: Address | null;
+  data: `0x${string}`;
+  value?: string;
+}
+
+export const handleDescribeTx: JsonHandler = async (req) => {
+  if (req.method !== "POST") return badRequest("POST only");
+  let body: DescribeReq;
+  try {
+    body = (await req.json()) as DescribeReq;
+  } catch {
+    return badRequest("invalid JSON body");
+  }
+  if (!body.chainId) return badRequest("chainId required");
+  const sem = await describeTx({
+    chainId: body.chainId,
+    to: body.to,
+    data: body.data,
+    value: body.value,
+  }).catch(() => null);
+  return json({ semantic: sem });
 };
 
 // Allowlisted RPC methods that the shim's eth_* catch-all may proxy through

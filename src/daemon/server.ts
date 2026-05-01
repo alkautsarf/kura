@@ -24,6 +24,7 @@ import {
   handleResolve,
   handleSimulate,
   handleDecode,
+  handleDescribeTx,
   handleRisk,
   handleRpcProxy,
 } from "./handlers.ts";
@@ -54,6 +55,7 @@ const ROUTES: Route[] = [
   { method: "GET", pattern: /^\/resolve$/, handler: handleResolve, authRequired: true },
   { method: "POST", pattern: /^\/simulate$/, handler: handleSimulate, authRequired: true },
   { method: "POST", pattern: /^\/decode$/, handler: handleDecode, authRequired: true },
+  { method: "POST", pattern: /^\/describe-tx$/, handler: handleDescribeTx, authRequired: true },
   { method: "POST", pattern: /^\/risk$/, handler: handleRisk, authRequired: true },
   // /rpc proxies allowlisted read-only eth_* methods to the chain's RPC.
   // The shim's catch-all hits this for eth_blockNumber, eth_call, etc.

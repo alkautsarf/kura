@@ -1,11 +1,14 @@
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { spawn } from "bun";
 import { render, useKeyboard, useRenderer } from "@opentui/solid";
-import { createSignal, createResource, createEffect, Show, For, onCleanup, onMount } from "solid-js";
+import { createSignal, createResource, createEffect, createMemo, Show, For, onCleanup, onMount } from "solid-js";
 import { formatUnits, parseUnits, isAddress } from "viem";
 // @ts-expect-error qrcode-terminal has no types
 import qrcode from "qrcode-terminal";
 import { KURA_HOME } from "../core/paths.ts";
 import { fmtAddr } from "../cli/format.ts";
+import { copyToClipboard } from "../core/clipboard.ts";
 import { getConfig, getWallet, isBiometryMigrated, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
@@ -77,6 +80,34 @@ async function del<T>(path: string): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+// Prefer qutebrowser (kura's primary target browser) over the system default,
+// which on this user's machine is Chrome. Resolved once at module load so we
+// don't re-stat 6 paths on every [o] keypress.
+const QB_PATH: string | null = (() => {
+  const candidates = [
+    Bun.which("qutebrowser"),
+    `${homedir()}/Library/Python/3.14/bin/qutebrowser`,
+    `${homedir()}/Library/Python/3.13/bin/qutebrowser`,
+    `${homedir()}/Library/Python/3.12/bin/qutebrowser`,
+    "/opt/homebrew/bin/qutebrowser",
+    "/usr/local/bin/qutebrowser",
+  ].filter((p): p is string => !!p);
+  for (const c of candidates) if (existsSync(c)) return c;
+  return null;
+})();
+
+function openUrl(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const cmd = QB_PATH ? [QB_PATH, url] : ["open", url];
+      const p = spawn({ cmd, stdout: "ignore", stderr: "ignore" });
+      p.exited.then((code) => resolve(code === 0)).catch(() => resolve(false));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 function fmtUsd(n: number | undefined): string {
   if (n === undefined || !Number.isFinite(n)) return "-";
   if (Math.abs(n) >= 1) return `$${n.toFixed(2)}`;
@@ -133,6 +164,10 @@ const ROW_COLORS = {
   dim: "#666",          // counter address, hash
   outArrow: "#c87a4a",  // muted orange (was bright #ff8c66)
   inArrow: "#88a070",   // muted green (was bright #a3be8c)
+  // tx detail extras (data field values, success/fail status)
+  value: "#e0e0e0",
+  ok: "#a3be8c",
+  bad: "#ff8c66",
 } as const;
 
 // Split a daemon description like "Swap 0.5 USDC for 0.0002 ETH on Relay Router"
@@ -197,7 +232,7 @@ async function reverseLookup(addr: string): Promise<string | null> {
   return null;
 }
 
-type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets";
+type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets" | "tx";
 
 interface AppProps {
   wallet: WalletProfile;
@@ -217,6 +252,20 @@ function App(props: AppProps) {
   // Hide unverified (no-USD-price) tokens by default; user toggles with [u].
   // Lives in App so it persists when navigating between views.
   const [showUnverified, setShowUnverified] = createSignal(false);
+  // Vim-style cursor for activity rows in home + history. Reset when view or
+  // wallet changes; clamped to visible items at render time.
+  const [cursor, setCursor] = createSignal(0);
+  const [txItem, setTxItem] = createSignal<ActivityItem | null>(null);
+  const [txReturnView, setTxReturnView] = createSignal<View>("home");
+  const [txDetailMode, setTxDetailMode] = createSignal<"overview" | "data">("overview");
+  const [copyToast, setCopyToast] = createSignal("");
+  let copyToastTimer: ReturnType<typeof setTimeout> | null = null;
+  function showCopyToast(msg: string): void {
+    if (copyToastTimer) clearTimeout(copyToastTimer);
+    setCopyToast(msg);
+    copyToastTimer = setTimeout(() => setCopyToast(""), 2000);
+  }
+  onCleanup(() => { if (copyToastTimer) clearTimeout(copyToastTimer); });
   const renderer = useRenderer();
 
   // Hand the live renderer to terminal.ts so the centralized quit() (which
@@ -365,12 +414,44 @@ function App(props: AppProps) {
     },
   );
 
-  const interval = setInterval(() => setTick((t) => t + 1), 30_000);
+  // Only tick when the user can actually see the data , avoids racking up
+  // background daemon roundtrips while they're managing wallets or sessions.
+  const interval = setInterval(() => {
+    if (view() === "home" || view() === "history") setTick((t) => t + 1);
+  }, 30_000);
   onCleanup(() => {
     clearInterval(interval);
     portfolioCtrl?.abort();
     historyCtrl?.abort();
   });
+
+  // Reset cursor on view/wallet/chain changes so the highlight doesn't dangle
+  // off the end of a refreshed list.
+  createEffect(() => {
+    void view();
+    void wallet().address;
+    void committedChainId();
+    setCursor(0);
+  });
+
+  // Visible activity items used for cursor navigation in home/history.
+  // Keep in sync with the slicing inside HomeView/HistoryView.
+  const visibleHomeItems = () => (history()?.items ?? []).filter((it) => !it.isDust).slice(0, 10);
+  const visibleHistoryItems = () => (history()?.items ?? []).slice(0, 50);
+  const cursorList = () => view() === "history" ? visibleHistoryItems() : visibleHomeItems();
+  function moveCursor(delta: number): void {
+    const max = Math.max(0, cursorList().length - 1);
+    setCursor((c) => Math.max(0, Math.min(max, c + delta)));
+  }
+  function openCurrentTx(): void {
+    const list = cursorList();
+    const it = list[cursor()];
+    if (!it) return;
+    setTxItem(it);
+    setTxReturnView(view() as View);
+    setTxDetailMode("overview");
+    setView("tx");
+  }
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
@@ -387,6 +468,15 @@ function App(props: AppProps) {
       else if (key.name === "g") setTick((t) => t + 1);
       else if (key.name === "u") setShowUnverified((v) => !v);
       else if (key.name === "n") void toggleMode();
+      else if (key.name === "j" || key.name === "down") moveCursor(1);
+      else if (key.name === "k" || key.name === "up") moveCursor(-1);
+      else if (key.name === "return") openCurrentTx();
+      else if (key.name === "y") {
+        const addr = wallet().address;
+        copyToClipboard(addr).then((ok) => {
+          showCopyToast(ok ? `copied ${fmtAddr(addr)}` : "copy failed");
+        });
+      }
       else if (key.name === "tab") {
         if (key.shift) {
           void cycleWallet();
@@ -405,6 +495,22 @@ function App(props: AppProps) {
       }
       return;
     }
+    if (view() === "history") {
+      if (key.name === "j" || key.name === "down") { moveCursor(1); return; }
+      if (key.name === "k" || key.name === "up") { moveCursor(-1); return; }
+      if (key.name === "return") { openCurrentTx(); return; }
+      if (key.name === "escape") { setView("home"); return; }
+      return;
+    }
+    if (view() === "tx") {
+      // tab / c / o / j / k are owned by TxDetailView's own useKeyboard so
+      // sub-view state (overview vs data, scroll offset) stays local.
+      if (key.name === "escape") {
+        setView(txReturnView());
+        setTxItem(null);
+      }
+      return;
+    }
     // Non-home views: only Esc returns home. Lets text input handlers see all other keys.
     // wallets owns its escape so sub-modes (name input, add-choose, etc) can pop one level.
     if (view() === "wallets") return;
@@ -414,15 +520,31 @@ function App(props: AppProps) {
   });
 
   const chain = () => chains().find((c) => c.id === chainId()) ?? getKnownChain(chainId());
+  // Derive native USD-per-token from the portfolio so detail view can show the
+  // gas USD equivalent without a separate price fetch.
+  const nativePriceUsd = (): number | null => {
+    const native = portfolio()?.tokens.find((t) => t.token === "native");
+    if (!native?.usd || !native?.balance) return null;
+    try {
+      const eth = Number(formatUnits(BigInt(native.balance), 18));
+      if (eth === 0) return null;
+      return native.usd / eth;
+    } catch { return null; }
+  };
 
   return (
     <box flexDirection="column" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={0} width="100%" height="100%">
-      <box flexDirection="row" justifyContent="space-between">
+      <box flexDirection="row" justifyContent="space-between" border={["bottom"]} borderColor="#333">
+        <text attributes={1}>kura</text>
         <box flexDirection="row">
-          <text attributes={1}>{`kura . ${view()}   `}</text>
-          <text fg={mode() === "testnet" ? "#f9a825" : "#a3be8c"} attributes={1}>{mode() === "testnet" ? "[TESTNET]" : "[MAINNET]"}</text>
+          <text fg={ROW_COLORS.amount}>{fmtAddr(wallet().address)}</text>
+          <text fg={ROW_COLORS.dim}> · </text>
+          <text>{wallet().name}</text>
+          <text fg={ROW_COLORS.dim}> · </text>
+          <text>{chain()?.name ?? `chain ${chainId()}`}</text>
+          <text fg={ROW_COLORS.dim}> · </text>
+          <text fg={mode() === "testnet" ? "#f9a825" : "#a3be8c"}>{mode()}</text>
         </box>
-        <text fg="#88c0d0">{`${fmtAddr(wallet().address)} . ${wallet().name} . ${chain()?.name ?? `chain ${chainId()}`}`}</text>
       </box>
 
       <Show when={view() === "home"}>
@@ -431,6 +553,7 @@ function App(props: AppProps) {
           history={history()}
           chain={chain()}
           showUnverified={showUnverified()}
+          cursor={cursor()}
         />
       </Show>
       <Show when={view() === "send"}>
@@ -440,7 +563,18 @@ function App(props: AppProps) {
         <ReceiveModal wallet={wallet()} chain={chain()} />
       </Show>
       <Show when={view() === "history"}>
-        <HistoryView items={history()?.items ?? []} chain={chain()} />
+        <HistoryView items={(history()?.items ?? []).slice(0, 50)} chain={chain()} cursor={cursor()} />
+      </Show>
+      <Show when={view() === "tx"}>
+        <TxDetailView
+          item={txItem()}
+          chain={chain()}
+          chainId={chainId()}
+          nativePrice={nativePriceUsd()}
+          mode={txDetailMode()}
+          onModeChange={setTxDetailMode}
+          onCopyToast={showCopyToast}
+        />
       </Show>
       <Show when={view() === "connections"}>
         <ConnectionsView />
@@ -460,19 +594,24 @@ function App(props: AppProps) {
 
       {/* spacer pushes footer to absolute bottom of pane */}
       <box flexGrow={1} />
-      <FooterHints view={view()} />
+      <Show when={copyToast()}>
+        <text fg={ROW_COLORS.amount}>{`  ${copyToast()}`}</text>
+      </Show>
+      <FooterHints view={view()} mode={txDetailMode()} />
     </box>
   );
 }
 
 // Single activity row with segmented colors. Reused by both HomeView and
 // HistoryView. `extras` adds optional trailing columns (block#, hash) for the
-// fuller history layout.
+// fuller history layout. `selected` flips the leading ` ` to `>` and brightens
+// the age column for vim-style cursor navigation.
 function ActivityRow(props: {
   it: ActivityItem;
   resolved: Record<string, string | null>;
   chain: KuraChainConfig | undefined;
   extras?: "history";
+  selected?: boolean;
 }) {
   const it = props.it;
   const counter = it.direction === "out" ? it.to : it.from;
@@ -516,8 +655,8 @@ function ActivityRow(props: {
     return k === "amount" ? ROW_COLORS.amount : k === "venue" ? ROW_COLORS.venue : ROW_COLORS.text;
   };
   return (
-    <box flexDirection="row">
-      <text fg={ROW_COLORS.age}>{`  ${fmtAge(it.timestamp).padEnd(5)} `}</text>
+    <box flexDirection="row" marginBottom={props.extras === "history" ? 0 : 1}>
+      <text fg={props.selected ? ROW_COLORS.amount : ROW_COLORS.age}>{`${props.selected ? "> " : "  "}${fmtAge(it.timestamp).padEnd(5)} `}</text>
       <text fg={arrowColor}>{`${arrowChar} `}</text>
       <For each={colored}>
         {(seg) => <text fg={segColor(seg.kind)}>{seg.text}</text>}
@@ -535,9 +674,12 @@ function HomeView(props: {
   history: { items: ActivityItem[] } | undefined;
   chain: KuraChainConfig | undefined;
   showUnverified: boolean;
+  cursor: number;
 }) {
   // Hide isDust spam from the home view (kura history shows them separately).
-  const items = () => (props.history?.items ?? []).filter((it) => !it.isDust).slice(0, 12);
+  // Cap at 10 rows; with marginBottom=1 each row takes 2 lines so 20 lines fits
+  // comfortably alongside the portfolio + header on a 36-line terminal.
+  const items = () => (props.history?.items ?? []).filter((it) => !it.isDust).slice(0, 10);
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
   createEffect(() => {
     const list = items();
@@ -578,9 +720,14 @@ function HomeView(props: {
             <For each={visibleTokens()}>
               {(t) => {
                 const tag = t.unverified ? "  [unverified]" : "";
-                const rowColor = t.unverified ? "#666" : undefined;
+                const dim = t.unverified;
+                const symColor = dim ? "#666" : ROW_COLORS.amount;
+                const restColor = dim ? "#666" : undefined;
                 return (
-                  <text fg={rowColor}>{`  ${t.symbol.padEnd(8)} ${fmtTok(t.balance, t.decimals).padStart(14)}  ${fmtUsd(t.usd).padStart(10)}  ${(t.pct ?? 0).toFixed(1)}%${tag}`}</text>
+                  <box flexDirection="row">
+                    <text fg={symColor}>{`  ${t.symbol.padEnd(8)} `}</text>
+                    <text fg={restColor}>{`${fmtTok(t.balance, t.decimals).padStart(14)}  ${fmtUsd(t.usd).padStart(10)}  ${(t.pct ?? 0).toFixed(1)}%${tag}`}</text>
+                  </box>
                 );
               }}
             </For>
@@ -598,7 +745,14 @@ function HomeView(props: {
         <box marginTop={1} flexDirection="column">
           <Show when={items().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no recent activity</text>}>
             <For each={items()}>
-              {(it) => <ActivityRow it={it} resolved={resolved()} chain={props.chain} />}
+              {(it, idx) => (
+                <ActivityRow
+                  it={it}
+                  resolved={resolved()}
+                  chain={props.chain}
+                  selected={idx() === props.cursor}
+                />
+              )}
             </For>
             <Show when={dustCount() > 0}>
               <text fg={ROW_COLORS.dim}>{`  + ${dustCount()} dust/spam tx${dustCount() === 1 ? "" : "s"} hidden`}</text>
@@ -763,7 +917,328 @@ function ReceiveModal(props: { wallet: WalletProfile; chain: KuraChainConfig | u
   );
 }
 
-function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | undefined }) {
+interface RpcResult<T> { result?: T; error?: { message: string } }
+async function rpcCall<T>(chainId: number, method: string, params: unknown[]): Promise<T | null> {
+  try {
+    const r = await post<RpcResult<T>>(`/rpc?chain=${chainId}`, { method, params });
+    return (r.result ?? null) as T | null;
+  } catch {
+    return null;
+  }
+}
+
+interface TxReceipt {
+  status?: string; // hex "0x1" success
+  gasUsed?: string;
+  effectiveGasPrice?: string;
+}
+interface TxFull {
+  nonce?: string;
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  input?: string;
+}
+interface SemanticTxLite {
+  kind: string;
+  description: string;
+  selector: string;
+  fnSignature?: string;
+  contract?: { address: string; label?: string };
+}
+
+function fmtGwei(weiHex: string | undefined): string {
+  if (!weiHex) return "?";
+  try {
+    const wei = BigInt(weiHex);
+    const gwei = Number(wei) / 1e9;
+    if (gwei >= 1) return gwei.toFixed(2);
+    return gwei.toFixed(4);
+  } catch { return "?"; }
+}
+
+function fmtEthFromWei(wei: bigint): string {
+  const eth = Number(wei) / 1e18;
+  if (eth >= 1) return eth.toFixed(4);
+  if (eth >= 1e-4) return eth.toFixed(6);
+  // Sub-millicent on L2: use enough decimals to keep all sig figs, then trim
+  // trailing zeros so 0.000000927 ETH stays readable (vs 9.27e-7 scientific).
+  if (eth >= 1e-12) return eth.toFixed(12).replace(/0+$/, "").replace(/\.$/, "");
+  return eth.toExponential(3);
+}
+
+function fmtAbsTime(ts: number): string {
+  if (!ts) return "?";
+  const d = new Date(ts);
+  const month = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()];
+  const day = d.getDate();
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${month} ${day} ${hh}:${mm}`;
+}
+
+function TxRow(props: { label: string; children: any }) {
+  return (
+    <box flexDirection="row">
+      <text fg={ROW_COLORS.age}>{`  ${props.label.padEnd(10)} `}</text>
+      <box flexDirection="row">{props.children}</box>
+    </box>
+  );
+}
+
+function TxDetailView(props: {
+  item: ActivityItem | null;
+  chain: KuraChainConfig | undefined;
+  chainId: number;
+  nativePrice: number | null;
+  mode: "overview" | "data";
+  onModeChange: (mode: "overview" | "data") => void;
+  onCopyToast?: (msg: string) => void;
+}) {
+  const item = () => props.item;
+  const mode = () => props.mode;
+  const setMode = (m: "overview" | "data") => props.onModeChange(m);
+  const [scroll, setScroll] = createSignal(0);
+  const [receipt] = createResource(
+    () => item()?.hash ?? null,
+    async (hash) => {
+      if (!hash) return null;
+      return rpcCall<TxReceipt>(props.chainId, "eth_getTransactionReceipt", [hash]);
+    },
+  );
+  const [tx] = createResource(
+    () => item()?.hash ?? null,
+    async (hash) => {
+      if (!hash) return null;
+      return rpcCall<TxFull>(props.chainId, "eth_getTransactionByHash", [hash]);
+    },
+  );
+  // Stable string key so createResource's identity diff doesn't refire on every
+  // re-render: any non-(hash,inputLen) signal change in App used to return a new
+  // object reference and trigger a redundant POST /describe-tx.
+  const semanticKey = (): string | null => {
+    const it = item();
+    const t = tx();
+    if (!it || !t?.input) return null;
+    return `${it.hash}:${t.input.length}`;
+  };
+  const [semantic] = createResource(
+    semanticKey,
+    async () => {
+      const it = item();
+      const t = tx();
+      if (!it || !t?.input) return null;
+      try {
+        const r = await post<{ semantic: SemanticTxLite | null }>(`/describe-tx`, {
+          chainId: props.chainId,
+          to: it.to,
+          data: t.input as `0x${string}`,
+          value: it.value,
+        });
+        return r.semantic;
+      } catch { return null; }
+    },
+  );
+  // Reset scroll when item changes; mode reset is owned by App.openCurrentTx.
+  createEffect(() => {
+    void item()?.hash;
+    setScroll(0);
+  });
+  function copyHash(): void {
+    const it = item();
+    if (!it) return;
+    void copyToClipboard(it.hash).then((ok) => {
+      props.onCopyToast?.(ok ? `copied ${fmtAddr(it.hash)}` : "copy failed");
+    });
+  }
+  function copyBytes(): void {
+    const t = tx();
+    const data = t?.input ?? "";
+    if (!data) return;
+    void copyToClipboard(data).then((ok) => {
+      props.onCopyToast?.(ok ? `copied ${data.length} chars of calldata` : "copy failed");
+    });
+  }
+  function openInExplorer(): void {
+    const it = item();
+    const explorer = props.chain?.explorer;
+    if (!it || !explorer) return;
+    void openUrl(`${explorer.replace(/\/$/, "")}/tx/${it.hash}`);
+  }
+  useKeyboard((key) => {
+    if (mode() === "overview") {
+      if (key.name === "tab" && item()?.hash) { setMode("data"); setScroll(0); return; }
+      if (key.name === "c") { copyHash(); return; }
+      if (key.name === "o") { openInExplorer(); return; }
+      return;
+    }
+    // data mode
+    if (key.name === "tab") { setMode("overview"); setScroll(0); return; }
+    if (key.name === "j" || key.name === "down") { setScroll((s) => s + 1); return; }
+    if (key.name === "k" || key.name === "up") { setScroll((s) => Math.max(0, s - 1)); return; }
+    if (key.name === "c") { copyBytes(); return; }
+    if (key.name === "o") { openInExplorer(); return; }
+  });
+  const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
+  createEffect(() => {
+    const it = item();
+    if (!it) return;
+    const targets: string[] = [it.from];
+    if (it.to) targets.push(it.to);
+    Promise.all(targets.map(async (a) => [a.toLowerCase(), await reverseLookup(a)] as const)).then((entries) => {
+      const next: Record<string, string | null> = {};
+      for (const [k, v] of entries) next[k] = v;
+      setResolved(next);
+    });
+  });
+  const status = () => {
+    const r = receipt();
+    if (receipt.loading) return { text: "loading...", color: ROW_COLORS.dim };
+    if (!r) return { text: "?", color: ROW_COLORS.dim };
+    return r.status === "0x1"
+      ? { text: "success", color: ROW_COLORS.ok }
+      : { text: "failed", color: ROW_COLORS.bad };
+  };
+  const gasLine = () => {
+    const r = receipt();
+    if (receipt.loading) return "loading...";
+    if (!r?.gasUsed) return "?";
+    try {
+      const used = BigInt(r.gasUsed);
+      const price = r.effectiveGasPrice ? BigInt(r.effectiveGasPrice) : 0n;
+      const cost = used * price;
+      const usedStr = used.toLocaleString("en-US");
+      const sym = props.chain?.symbol ?? "ETH";
+      let usdStr = "";
+      if (props.nativePrice) {
+        const usd = (Number(cost) / 1e18) * props.nativePrice;
+        // Sub-cent gas (typical L2) keeps 4 decimals; otherwise 2.
+        usdStr = ` · ~$${usd < 0.01 ? usd.toFixed(4) : usd.toFixed(2)}`;
+      }
+      return `${usedStr} · ${fmtGwei(r.effectiveGasPrice)} gwei · ~${fmtEthFromWei(cost)} ${sym}${usdStr}`;
+    } catch { return "?"; }
+  };
+  const nonce = () => {
+    const t = tx();
+    if (tx.loading) return "loading...";
+    if (!t?.nonce) return "?";
+    try { return BigInt(t.nonce).toString(); } catch { return "?"; }
+  };
+  const description = () => item()?.description ?? "(no description)";
+  const segments = () => colorizeDescription(description());
+  // Memoized so the JSX can read the array length, slice it, and check empty
+  // without re-slicing the whole input on every render.
+  const calldataLines = createMemo<string[]>(() => {
+    const data = tx()?.input ?? "0x";
+    if (!data || data === "0x") return [];
+    const body = data.startsWith("0x") ? data.slice(2) : data;
+    const lines: string[] = [];
+    const width = 76;
+    for (let i = 0; i < body.length; i += width) lines.push(body.slice(i, i + width));
+    return lines;
+  });
+  const VISIBLE_LINES = 18;
+  const visibleCalldata = () => {
+    const all = calldataLines();
+    if (all.length === 0) return [];
+    const start = Math.min(scroll(), Math.max(0, all.length - VISIBLE_LINES));
+    return all.slice(start, start + VISIBLE_LINES);
+  };
+  return (
+    <box marginTop={1} flexDirection="column">
+      <text attributes={1}>{mode() === "data" ? "kura · transaction · data" : "kura · transaction"}</text>
+      <Show when={item()} fallback={<text fg={ROW_COLORS.dim} marginTop={1}>  no item</text>}>
+        <Show when={mode() === "overview"}>
+          <box marginTop={1} flexDirection="column">
+            <TxRow label="hash">
+              <text fg={ROW_COLORS.value}>{item()!.hash}</text>
+            </TxRow>
+            <TxRow label="chain">
+              <text fg={ROW_COLORS.value}>{props.chain?.name ?? `chain ${props.chainId}`}</text>
+            </TxRow>
+            <TxRow label="block">
+              <text fg={ROW_COLORS.value}>{item()!.blockNumber.toString()}</text>
+            </TxRow>
+            <TxRow label="age">
+              <text fg={ROW_COLORS.value}>{`${fmtAge(item()!.timestamp)}`}</text>
+              <text fg={ROW_COLORS.dim}>{` · ${fmtAbsTime(item()!.timestamp)}`}</text>
+            </TxRow>
+            <TxRow label="status">
+              <text fg={status().color}>{status().text}</text>
+            </TxRow>
+            <TxRow label="nonce">
+              <text fg={ROW_COLORS.value}>{nonce()}</text>
+            </TxRow>
+          </box>
+          <box marginTop={1} flexDirection="column">
+            <TxRow label="from">
+              <text fg={ROW_COLORS.amount}>{fmtAddr(item()!.from)}</text>
+              <Show when={resolved()[item()!.from.toLowerCase()]}>
+                {(name) => <text fg={ROW_COLORS.dim}>{`  · ${name()}`}</text>}
+              </Show>
+            </TxRow>
+            <TxRow label="to">
+              <text fg={ROW_COLORS.amount}>{item()!.to ? fmtAddr(item()!.to) : "(create)"}</text>
+              <Show when={item()!.to && resolved()[item()!.to!.toLowerCase()]}>
+                {(name) => <text fg={ROW_COLORS.dim}>{`  · ${name()}`}</text>}
+              </Show>
+              <Show when={semantic()?.contract?.label}>
+                {(label) => <text fg={ROW_COLORS.dim}>{`  · ${label()}`}</text>}
+              </Show>
+            </TxRow>
+            <TxRow label="function">
+              <Show when={semantic()} fallback={<text fg={ROW_COLORS.dim}>{semantic.loading ? "loading..." : "—"}</text>}>
+                <text fg={ROW_COLORS.value}>{semantic()!.fnSignature ?? semantic()!.selector}</text>
+                <Show when={semantic()!.fnSignature}>
+                  <text fg={ROW_COLORS.dim}>{`  · ${semantic()!.selector}`}</text>
+                </Show>
+              </Show>
+            </TxRow>
+          </box>
+          <box marginTop={1} flexDirection="column">
+            <box flexDirection="row">
+              <text fg={ROW_COLORS.age}>{`  `}</text>
+              <For each={segments()}>
+                {(seg) => {
+                  const c = seg.kind === "amount" ? ROW_COLORS.amount : seg.kind === "venue" ? ROW_COLORS.venue : ROW_COLORS.text;
+                  return <text fg={c}>{seg.text}</text>;
+                }}
+              </For>
+            </box>
+          </box>
+          <box marginTop={1} flexDirection="column">
+            <TxRow label="gas">
+              <text fg={ROW_COLORS.value}>{gasLine()}</text>
+            </TxRow>
+          </box>
+        </Show>
+        <Show when={mode() === "data"}>
+          <box marginTop={1} flexDirection="column">
+            <TxRow label="function">
+              <Show when={semantic()} fallback={<text fg={ROW_COLORS.dim}>{semantic.loading ? "loading..." : "—"}</text>}>
+                <text fg={ROW_COLORS.value}>{semantic()!.fnSignature ?? semantic()!.selector}</text>
+              </Show>
+            </TxRow>
+            <TxRow label="bytes">
+              <text fg={ROW_COLORS.value}>{`${calldataLines().length === 0 ? 0 : (tx()?.input?.length ?? 2) - 2} chars`}</text>
+              <Show when={calldataLines().length > VISIBLE_LINES}>
+                <text fg={ROW_COLORS.dim}>{`  · line ${Math.min(scroll(), Math.max(0, calldataLines().length - VISIBLE_LINES)) + 1}-${Math.min(scroll() + VISIBLE_LINES, calldataLines().length)} of ${calldataLines().length}`}</text>
+              </Show>
+            </TxRow>
+          </box>
+          <box marginTop={1} flexDirection="column">
+            <Show when={calldataLines().length > 0} fallback={<text fg={ROW_COLORS.dim}>  (empty calldata)</text>}>
+              <For each={visibleCalldata()}>
+                {(line) => <text fg={ROW_COLORS.value}>{`  ${line}`}</text>}
+              </For>
+            </Show>
+          </box>
+        </Show>
+      </Show>
+    </box>
+  );
+}
+
+function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | undefined; cursor: number }) {
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
   // History view shows everything including dust (with a [dust] tag) so the
   // user can audit; only HomeView hides them outright.
@@ -782,10 +1257,9 @@ function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | un
       setResolved((prev) => ({ ...prev, ...next }));
     });
   });
-  // Cap rendered rows to fit typical terminal heights (36 lines minus
-  // header/footer leaves ~30 usable). The previous tighter cap of 15 was a
-  // defensive workaround for an old opentui-solid render bug; bumped now that
-  // the underlying issue has settled. Use `kura history` CLI for >50 items.
+  // Cap rendered rows to fit typical terminal heights. With marginBottom=1 each
+  // row takes 2 lines, so 50 rows = ~100 lines. Use `kura history` CLI for the
+  // full feed; this view shows the most recent.
   const MAX_ROWS = 50;
   const visible = () => props.items.slice(0, MAX_ROWS);
   const overflow = () => Math.max(0, props.items.length - MAX_ROWS);
@@ -795,7 +1269,15 @@ function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | un
       <box marginTop={1} flexDirection="column">
         <Show when={visible().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no activity</text>}>
           <For each={visible()}>
-            {(it) => <ActivityRow it={it} resolved={resolved()} chain={props.chain} extras="history" />}
+            {(it, idx) => (
+              <ActivityRow
+                it={it}
+                resolved={resolved()}
+                chain={props.chain}
+                extras="history"
+                selected={idx() === props.cursor}
+              />
+            )}
           </For>
           <Show when={overflow() > 0}>
             <text fg={ROW_COLORS.dim}>{`  +${overflow()} more  ·  use \`kura history\` CLI for full feed`}</text>
@@ -1352,23 +1834,27 @@ function WalletView(props: {
   );
 }
 
-function FooterHints(props: { view: View }) {
+function FooterHints(props: { view: View; mode?: "overview" | "data" }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [u] unverified  [g] refresh  [q] quit";
+        return "[j/k] move  [enter] detail  [y] copy addr  [s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mode  [u] unverified  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
         return "esc back";
       case "history":
-        return "esc back";
+        return "[j/k] move  [enter] detail  esc back";
       case "connections":
         return "j/k to move, d to revoke, esc back";
       case "watch":
         return "esc back";
       case "wallets":
         return "j/k move  enter set default  a add  d remove  D remove+purge  esc back";
+      case "tx":
+        return props.mode === "data"
+          ? "[j/k] scroll  [c] copy bytes  [o] open explorer  [tab] back to overview  [esc] back"
+          : "[tab] data  [c] copy hash  [o] open explorer  [esc] back";
     }
   };
   return (

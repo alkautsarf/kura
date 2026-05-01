@@ -1,4 +1,3 @@
-import { spawn } from "bun";
 import { render, useKeyboard, useRenderer } from "@opentui/solid";
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { hexToString } from "viem";
@@ -9,6 +8,7 @@ import { fmtAddr } from "../cli/format.ts";
 import { getKnownChain } from "../core/chains.ts";
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
+import { copyToClipboard } from "../core/clipboard.ts";
 import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
 
 interface PendingDetail {
@@ -59,19 +59,6 @@ interface PopupProps {
 function cleanSource(src: string): string {
   // Strip the internal "shim:" / "tui:" / "cli:" prefix; show just the origin.
   return src.replace(/^(shim|tui|cli|mcp):/, "").replace(/^https?:\/\//, "");
-}
-
-function copyToClipboard(text: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    try {
-      const p = spawn({ cmd: ["pbcopy"], stdin: "pipe", stdout: "ignore", stderr: "ignore" });
-      p.stdin.write(text);
-      p.stdin.end();
-      p.exited.then((code) => resolve(code === 0)).catch(() => resolve(false));
-    } catch {
-      resolve(false);
-    }
-  });
 }
 
 function fmtAmt(raw: string | undefined, decimals: number): string {
