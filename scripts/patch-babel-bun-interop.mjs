@@ -23,19 +23,28 @@ const patches = [
     replace: "const debug = (typeof _debug==='function'?_debug:(_debug&&typeof _debug.default==='function'?_debug.default:_debug&&typeof _debug.debug==='function'?_debug.debug:()=>()=>{}))(",
   },
   // @opentui/solid/scripts/solid-plugin.ts imports transformAsync from
-  // @babel/core; bun --compile sometimes wraps it as { default: fn } namespace
-  // object so the call `transformAsync(code, ...)` blows up with
-  // "transformAsync is not a function". Patch the call site with a typeof check.
+  // @babel/core. bun --compile's CJS interop sometimes leaves the named
+  // binding undefined (the require returns { default: { transformAsync, ... } }
+  // and the destructure picks nothing). Patch the IMPORT line to a namespace
+  // form and extract transformAsync via a dual-key check so the binding is
+  // always a function regardless of which wrapping bun produces.
   {
     file: "node_modules/@opentui/solid/scripts/solid-plugin.ts",
-    find: "const transforms = await transformAsync(code, {",
-    replace: "const transforms = await (typeof transformAsync==='function'?transformAsync:transformAsync.default||transformAsync.transformAsync)(code, {",
+    find: 'import { transformAsync } from "@babel/core"',
+    replace: 'import * as _babelCore from "@babel/core"\nconst transformAsync = (_babelCore && (_babelCore.transformAsync || (_babelCore.default && _babelCore.default.transformAsync))) || (() => { throw new Error("kura: babel transformAsync interop failed") })',
   },
-  // Replace the older 1-level patch with the typeof-checking form too.
+  // Revert previously-patched call sites back to the clean form , the import
+  // patch above gives us a working `transformAsync` so the call site no longer
+  // needs the typeof-wrapper that itself crashed when transformAsync was nil.
+  {
+    file: "node_modules/@opentui/solid/scripts/solid-plugin.ts",
+    find: "const transforms = await (typeof transformAsync==='function'?transformAsync:transformAsync.default||transformAsync.transformAsync)(code, {",
+    replace: "const transforms = await transformAsync(code, {",
+  },
   {
     file: "node_modules/@opentui/solid/scripts/solid-plugin.ts",
     find: "const transforms = await (transformAsync.default || transformAsync)(code, {",
-    replace: "const transforms = await (typeof transformAsync==='function'?transformAsync:transformAsync.default||transformAsync.transformAsync)(code, {",
+    replace: "const transforms = await transformAsync(code, {",
   },
   // @babel/helper-replace-supers destructures `assignmentExpression`, etc.
   // from `_core.types`. bun --compile wraps `_core` as a namespace object so
