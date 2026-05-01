@@ -330,7 +330,7 @@ function App(props: AppProps) {
   const chain = () => chains().find((c) => c.id === chainId()) ?? getKnownChain(chainId());
 
   return (
-    <box flexDirection="column" padding={1} width="100%" height="100%">
+    <box flexDirection="column" paddingTop={1} paddingLeft={1} paddingRight={1} width="100%" height="100%">
       <box flexDirection="row" justifyContent="space-between">
         <box flexDirection="row">
           <text attributes={1}>{`kura . ${view()}   `}</text>
