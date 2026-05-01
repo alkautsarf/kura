@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-04-30
+
+### Added
+- `kura wallet` subcommand for ergonomic wallet management without re-running the full `kura init` wizard:
+  - `kura wallet list` (default) prints all wallets with the default marked.
+  - `kura wallet add <name>` adds a wallet. Flags: `--generate` (random key), `--import-key <hex|->` (paste or stdin), `--watch-only <0x...>` (watch address), `--default` (set as default after adding). Without flags it prompts interactively.
+  - `kura wallet use <name>` (alias `switch`) writes the new default to `~/.kura/config.toml`.
+  - `kura wallet remove <name>` drops the wallet from `state.json`. `--purge-key` also deletes the macOS Keychain entry. If the removed wallet was the default, the next remaining wallet (insertion order) becomes default automatically.
+  - `kura wallet show <name>` prints address, source, keychain location, and creation date.
+- TUI `Shift+Tab` cycles between configured wallets, persists the new default to config, and triggers portfolio + history refetch with the new address. Pairs with `Tab` (chain cycle).
+
+### Changed
+- `kura init` now delegates wallet creation to `src/core/wallet.ts` primitives (`createGeneratedWallet`, `createImportedWallet`, `createWatchOnlyWallet`, `createSharedKeychainWallet`) so `kura wallet add` and `kura init` produce identical state. No behavior change for `init`.
+
+### Fixed
+- `package.json` `dev` and `daemon` scripts: `--preload` flag must come AFTER `bun run`, not before. Bun 1.3.x's CLI parser rejects `bun --preload X run file.ts` with a help dump (treats `run` as a script name). Changed to `bun run --preload @opentui/solid/preload src/index.ts [daemon]`.
+- TUI escape leak (`^[]10;rgb:...`, `^[]11;rgb:...`, `^[[?997;1n` floods bleeding into the parent shell after quit, especially when quitting while balances were still loading). The actual root cause turned out to be deeper than ordering: opentui's `CliRenderer.destroy()` is a no-op when a frame is mid-flight (`this.rendering === true`). It sets `_destroyPending = true` and returns, expecting the render loop's `finally` block to call `finalizeDestroy()` on the next tick. Because our `process.exit` ran on the same tick, the event loop died before that next tick could run, so the native Zig renderer never tore down and its pending stdout writes (plus the unconsumed OSC 10/11 responses sitting in the stdin parser) leaked after the process was gone. Quitting during loading reproduced it almost every time because the active fetches kept the render loop busy. Fix layers:
+  1. Centralized shutdown in `src/core/terminal.ts` `quit(code)`: disable async notification modes (mode 996/2031/etc), call `renderer.destroy()`, then force-call `renderer.finalizeDestroy()` to defeat the mid-frame deferral, then `process.exit(code)`. `attachRestoreHandlers` SIGINT/SIGTERM/SIGHUP all route through this; the `'exit'` handler does the drain.
+  2. TUI and popup pass `{ exitSignals: [], exitOnCtrlC: false }` to `render()` so opentui's own `CliRenderer` does not register competing signal handlers (kura owns the entire shutdown sequence).
+  3. TUI/popup register the renderer with terminal.ts via `setActiveRenderer(useRenderer())` in `onMount`, and route the in-app Ctrl+C keypress through `quit()` for a single canonical shutdown path.
+  4. `drainStdinOverWindow` no longer bails early on quietness when no chunk has been received yet (so a slow terminal that takes 200ms to even START responding does not get cut off). Window bumped to 800ms before alt-screen exit + 200ms after.
+  5. Final `tcflush(STDIN, TCIFLUSH)` via Bun FFI discards anything still queued in the kernel PTY buffer that arrived between drain end and the parent shell taking over the TTY. Belt-and-suspenders.
+- SIGINT and SIGHUP now exit with code 0 instead of 130 / 129. For an interactive TUI, Ctrl+C is the user's chosen quit path (same as `q`), and the previous 130 made `bun run` print "error: script 'dev' exited with code 130" on every clean quit. SIGTERM still exits 143 because that signal usually means an external supervisor decided to stop us, which is worth signaling upward.
+
+[0.1.5]: https://github.com/alkautsarf/kura/releases/tag/v0.1.5
+
 ## [0.1.4] - 2026-04-30
 
 ### Fixed

@@ -1,16 +1,16 @@
 import { existsSync } from "node:fs";
-import { render, useKeyboard } from "@opentui/solid";
+import { render, useKeyboard, useRenderer } from "@opentui/solid";
 import { createSignal, createResource, createEffect, Show, For, onCleanup, onMount } from "solid-js";
 import { formatUnits, parseUnits, isAddress } from "viem";
 // @ts-expect-error qrcode-terminal has no types
 import qrcode from "qrcode-terminal";
 import { KURA_HOME } from "../core/paths.ts";
-import { getConfig, getWallet, listWallets, writeConfig } from "../core/config.ts";
+import { getConfig, getWallet, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
 import { getKnownChain } from "../core/chains.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
-import { restoreTerminal, attachRestoreHandlers } from "../core/terminal.ts";
+import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
 
 interface ApiClient {
   base: string;
@@ -153,6 +153,7 @@ type View = "home" | "send" | "receive" | "history" | "connections" | "watch";
 
 interface AppProps {
   wallet: WalletProfile;
+  walletList: WalletProfile[];
   initialChainId: number;
   initialMode: NetworkMode;
 }
@@ -163,6 +164,19 @@ function App(props: AppProps) {
   const [tick, setTick] = createSignal(0);
   const [mode, setModeSignal] = createSignal<NetworkMode>(props.initialMode);
   const [chains, setChains] = createSignal<KuraChainConfig[]>([]);
+  const [wallet, setWallet] = createSignal<WalletProfile>(props.wallet);
+  const [wallets, setWallets] = createSignal<WalletProfile[]>(props.walletList);
+  const renderer = useRenderer();
+
+  // Hand the live renderer to terminal.ts so the centralized quit() (which
+  // is what attachRestoreHandlers' SIGINT/SIGTERM/SIGHUP routes through) can
+  // call destroy() before process.exit. Without this, signal-driven exits
+  // would skip the native render pipeline's flush and pending writes would
+  // leak into the parent shell after the process is gone.
+  onMount(() => {
+    setActiveRenderer(renderer ?? null);
+    onCleanup(() => setActiveRenderer(null));
+  });
 
   const [chainList] = createResource(
     () => mode(),
@@ -192,6 +206,28 @@ function App(props: AppProps) {
     }
   }
 
+  // Cycle to the next wallet (insertion order from state.json) and persist
+  // as the default. Reload the wallet list from disk first so an `add` from
+  // another pane is reflected without restarting the TUI.
+  async function cycleWallet(): Promise<void> {
+    let list: WalletProfile[];
+    try {
+      list = await listWallets();
+    } catch {
+      list = wallets();
+    }
+    if (list.length <= 1) return;
+    setWallets(list);
+    const idx = list.findIndex((w) => w.name === wallet().name);
+    const next = list[(idx + 1) % list.length]!;
+    setWallet(next);
+    try {
+      await setDefaultWallet(next.name);
+    } catch {
+      // non-fatal: in-memory switch still works for the session
+    }
+  }
+
   // Debounced chain id: when the user spams `tab` to cycle visually, we don't
   // want to fire portfolio/history fetches on every press. Wait 200ms after the
   // last tab settled, then commit the new id so the heavy fetchers fire once.
@@ -209,24 +245,24 @@ function App(props: AppProps) {
   let portfolioCtrl: AbortController | null = null;
   let historyCtrl: AbortController | null = null;
   const [portfolio] = createResource(
-    () => [committedChainId(), tick()] as const,
-    async ([cid]) => {
+    () => [committedChainId(), tick(), wallet().address] as const,
+    async ([cid, _t, addr]) => {
       portfolioCtrl?.abort();
       portfolioCtrl = new AbortController();
       try {
-        return await getSignal<Portfolio>(`/portfolio?chain=${cid}&address=${props.wallet.address}`, portfolioCtrl.signal);
+        return await getSignal<Portfolio>(`/portfolio?chain=${cid}&address=${addr}`, portfolioCtrl.signal);
       } catch {
         return null;
       }
     },
   );
   const [history] = createResource(
-    () => [committedChainId(), tick()] as const,
-    async ([cid]) => {
+    () => [committedChainId(), tick(), wallet().address] as const,
+    async ([cid, _t, addr]) => {
       historyCtrl?.abort();
       historyCtrl = new AbortController();
       try {
-        return await getSignal<{ items: ActivityItem[] }>(`/history?chain=${cid}&address=${props.wallet.address}&limit=50`, historyCtrl.signal);
+        return await getSignal<{ items: ActivityItem[] }>(`/history?chain=${cid}&address=${addr}&limit=50`, historyCtrl.signal);
       } catch {
         return { items: [] as ActivityItem[] };
       }
@@ -242,10 +278,10 @@ function App(props: AppProps) {
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
-      process.exit(0);
+      quit(0);
     }
     if (view() === "home") {
-      if (key.name === "q") process.exit(0);
+      if (key.name === "q") quit(0);
       else if (key.name === "s") setView("send");
       else if (key.name === "r") setView("receive");
       else if (key.name === "h") setView("history");
@@ -254,6 +290,10 @@ function App(props: AppProps) {
       else if (key.name === "g") setTick((t) => t + 1);
       else if (key.name === "n") void toggleMode();
       else if (key.name === "tab") {
+        if (key.shift) {
+          void cycleWallet();
+          return;
+        }
         // Defensive: ensure current chainId is always in the rotation, even if
         // the daemon's /chains list excludes it (e.g., user has a testnet as
         // default but the daemon doesn't return it). This way `tab` never
@@ -282,7 +322,7 @@ function App(props: AppProps) {
           <text attributes={1}>{`kura . ${view()}   `}</text>
           <text fg={mode() === "testnet" ? "#f9a825" : "#a3be8c"} attributes={1}>{mode() === "testnet" ? "[TESTNET]" : "[MAINNET]"}</text>
         </box>
-        <text fg="#88c0d0">{`${fmtAddr(props.wallet.address)} . ${props.wallet.name} . ${chain()?.name ?? `chain ${chainId()}`}`}</text>
+        <text fg="#88c0d0">{`${fmtAddr(wallet().address)} . ${wallet().name} . ${chain()?.name ?? `chain ${chainId()}`}`}</text>
       </box>
 
       {/* Content area takes all available vertical space so the footer below
@@ -297,10 +337,10 @@ function App(props: AppProps) {
           />
         </Show>
         <Show when={view() === "send"}>
-          <SendModal wallet={props.wallet} chainId={chainId()} chain={chain()} onDone={() => setView("home")} />
+          <SendModal wallet={wallet()} chainId={chainId()} chain={chain()} onDone={() => setView("home")} />
         </Show>
         <Show when={view() === "receive"}>
-          <ReceiveModal wallet={props.wallet} chain={chain()} />
+          <ReceiveModal wallet={wallet()} chain={chain()} />
         </Show>
         <Show when={view() === "history"}>
           <HistoryView items={history()?.items ?? []} chain={chain()} />
@@ -729,7 +769,7 @@ function FooterHints(props: { view: View }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[s] send  [r] receive  [h] history  [c] connections  [w] watch  [tab] chain  [n] mainnet/testnet  [g] refresh  [q] quit";
+        return "[s] send  [r] receive  [h] history  [c] connections  [w] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
@@ -749,7 +789,8 @@ function FooterHints(props: { view: View }) {
   );
 }
 
-// restoreTerminal lives in core/terminal.ts. Shared with popup.
+// quit / restoreTerminal / signal wiring all live in core/terminal.ts.
+// Shared with popup.
 
 export async function run(): Promise<void> {
   if (!existsSync(KURA_HOME)) {
@@ -758,15 +799,32 @@ export async function run(): Promise<void> {
     return;
   }
   const cfg = await getConfig();
-  let wallet = await getWallet(cfg.defaultWallet);
-  if (!wallet) {
-    const all = await listWallets();
-    if (all.length === 0) {
-      console.error(`no wallets configured. run 'kura init' first.`);
-      process.exit(1);
-    }
-    wallet = all[0]!;
+  const all = await listWallets();
+  if (all.length === 0) {
+    console.error(`no wallets configured. run 'kura init' first.`);
+    process.exit(1);
   }
+  const wallet = (await getWallet(cfg.defaultWallet)) ?? all[0]!;
+  // Pre-disable async notification modes BEFORE opentui starts touching the
+  // terminal. If a prior unclean exit (e.g., kill -9) left mode 996/2031
+  // enabled, opentui's own startup writes (color detection queries, alt-screen
+  // entry, cursor positioning) would trigger ?997;1n floods immediately.
+  disableTerminalNotifications();
+  // attachRestoreHandlers must be installed BEFORE render so a SIGINT during
+  // opentui startup (before App.onMount has a chance to wire setActiveRenderer)
+  // still routes through quit(), which is a no-op on the renderer in that
+  // window but still disables modes and drains stdin via the 'exit' handler.
   attachRestoreHandlers();
-  render(() => <App wallet={wallet!} initialChainId={cfg.defaultChain} initialMode={cfg.networkMode} />);
+  // exitSignals: [] tells opentui's CliRenderer NOT to register its own
+  // SIGINT/SIGTERM/etc. listeners. We own all signal handling so the
+  // disable -> destroy -> drain ordering is preserved. Without this, opentui
+  // would call destroy() from its own SIGINT handler BEFORE our disable runs,
+  // and destroy()'s color-reset writes would re-trigger ?997 floods.
+  // exitOnCtrlC: false stops opentui's keypress handler from auto-destroying
+  // on Ctrl+C; the App's useKeyboard handler routes Ctrl+C through quit()
+  // explicitly so we keep one canonical shutdown path.
+  render(
+    () => <App wallet={wallet} walletList={all} initialChainId={cfg.defaultChain} initialMode={cfg.networkMode} />,
+    { exitSignals: [], exitOnCtrlC: false },
+  );
 }

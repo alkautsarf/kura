@@ -89,6 +89,12 @@ export async function writeConfig(cfg: KuraConfig, path: string = PATH_CONFIG): 
   await writeFile(path, tomlStringify(cfg), { mode: 0o600 });
 }
 
+export async function setDefaultWallet(name: string): Promise<void> {
+  const cfg = await getConfig();
+  if (cfg.defaultWallet === name) return;
+  await writeConfig({ ...cfg, defaultWallet: name });
+}
+
 interface StateFile {
   wallets: Record<string, WalletProfile>;
   sessions: Record<string, { walletName: string; address: string; chainId: number; connectedAt: number }>;

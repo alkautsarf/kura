@@ -1,6 +1,6 @@
 {
   "name": "kura",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces.",
   "type": "module",
   "private": true,
@@ -18,8 +18,8 @@
     "kura": "./src/index.ts"
   },
   "scripts": {
-    "dev": "bun --preload @opentui/solid/preload run src/index.ts",
-    "daemon": "bun --preload @opentui/solid/preload run src/index.ts daemon",
+    "dev": "bun run --preload @opentui/solid/preload src/index.ts",
+    "daemon": "bun run --preload @opentui/solid/preload src/index.ts daemon",
     "build": "bun build.ts",
     "build:darwin-arm64": "bun build.ts bun-darwin-arm64 dist/kura-darwin-arm64",
     "build:linux-x64": "bun build.ts bun-linux-x64 dist/kura-linux-x64",

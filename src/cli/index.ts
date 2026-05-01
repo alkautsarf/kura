@@ -9,7 +9,8 @@ export async function run(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  if (cmd !== "init" && cmd !== "daemon" && cmd !== "popup" && cmd !== "proxy") {
+  const NO_DAEMON_NEEDED = new Set(["init", "daemon", "popup", "proxy", "wallet"]);
+  if (!NO_DAEMON_NEEDED.has(cmd)) {
     const ok = await checkDaemon();
     if (!ok) {
       console.error(`${COLOR.red}daemon not reachable${COLOR.reset}`);
@@ -73,6 +74,24 @@ export async function run(argv: string[]): Promise<void> {
           uninstallLaunchd: args["uninstall-launchd"],
         };
         const { run } = await import("./commands/proxy.ts");
+        return await run(normalized);
+      }
+      case "wallet": {
+        const args = mri<any>(rest, {
+          string: ["import-key", "watch-only"],
+          boolean: ["generate", "default", "purge-key", "yes"],
+          alias: { g: "generate", d: "default", y: "yes" },
+        });
+        const normalized = {
+          _: args._,
+          generate: args.generate,
+          importKey: args["import-key"],
+          watchOnly: args["watch-only"],
+          default: args.default,
+          purgeKey: args["purge-key"],
+          yes: args.yes,
+        };
+        const { run } = await import("./commands/wallet.ts");
         return await run(normalized);
       }
       case "init": {

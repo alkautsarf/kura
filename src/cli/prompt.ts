@@ -64,3 +64,11 @@ export async function choose(question: string, options: { label: string; value: 
   const idx = Math.max(1, Math.min(options.length, parseInt(ans, 10) || 1)) - 1;
   return options[idx]!.value;
 }
+
+export async function readStdin(): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let buf = "";
+    stdin.on("data", (chunk) => (buf += chunk.toString()));
+    stdin.on("end", () => resolve(buf.trim()));
+  });
+}

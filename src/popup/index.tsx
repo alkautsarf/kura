@@ -1,11 +1,11 @@
-import { render, useKeyboard } from "@opentui/solid";
-import { createSignal, Show, For } from "solid-js";
+import { render, useKeyboard, useRenderer } from "@opentui/solid";
+import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { decodeFunctionData, parseAbi, hexToString } from "viem";
 import type { PendingRequest, RiskFinding, RiskLevel, RiskResult, SimulationResult } from "../core/types.ts";
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import { decodeCalldata } from "../core/decode.ts";
-import { restoreTerminal, attachRestoreHandlers } from "../core/terminal.ts";
+import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
 
 interface PendingDetail {
   request: PendingRequest;
@@ -83,8 +83,21 @@ function Popup(props: PopupProps) {
   const [view, setView] = createSignal<"outcome" | "calldata">("outcome");
   const [busy, setBusy] = createSignal(false);
   const [status, setStatus] = createSignal<string>("");
+  const renderer = useRenderer();
+
+  // Hand the live renderer to terminal.ts so signal-driven shutdowns
+  // (SIGINT/SIGTERM/SIGHUP routed through quit) can destroy it before
+  // process.exit. See src/core/terminal.ts for the full ordering rationale.
+  onMount(() => {
+    setActiveRenderer(renderer ?? null);
+    onCleanup(() => setActiveRenderer(null));
+  });
 
   useKeyboard((key) => {
+    if (key.ctrl && key.name === "c") {
+      quit(0);
+      return;
+    }
     if (busy()) return;
     if (key.name === "tab") {
       setView(view() === "outcome" ? "calldata" : "outcome");
@@ -341,8 +354,11 @@ export async function run(args: string[]): Promise<void> {
   const decoded = decodeArgs(data as `0x${string}`, parity.signature);
   decoded.selector = parity.selector || decoded.selector;
 
-  // Shared restoreTerminal lives in core/terminal.ts (handles disable +
-  // synchronous drain + alt-screen exit so OSC/DEC responses don't leak).
+  // Pre-disable async notification modes BEFORE opentui starts touching
+  // the terminal, then install signal handlers that route through quit()
+  // so SIGINT/SIGTERM never bypass renderer.destroy(). See terminal.ts for
+  // the full ordering rationale (matches the TUI run() in src/tui/index.tsx).
+  disableTerminalNotifications();
   attachRestoreHandlers();
 
   let resolved = false;
@@ -355,11 +371,14 @@ export async function run(args: string[]): Promise<void> {
       body: JSON.stringify({ decision }),
       tls: { rejectUnauthorized: false },
     } as RequestInit);
-    setTimeout(() => {
-      restoreTerminal();
-      process.exit(0);
-    }, 200);
+    setTimeout(() => quit(0), 200);
   };
 
-  render(() => <Popup detail={detail} decoded={decoded} onDecide={onDecide} />);
+  // exitSignals: [] / exitOnCtrlC: false: kura owns shutdown. The Popup
+  // component's useKeyboard catches Ctrl+C and routes it through quit(),
+  // and attachRestoreHandlers wires SIGINT/SIGTERM/SIGHUP to quit() too.
+  render(
+    () => <Popup detail={detail} decoded={decoded} onDecide={onDecide} />,
+    { exitSignals: [], exitOnCtrlC: false },
+  );
 }

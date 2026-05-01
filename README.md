@@ -42,12 +42,15 @@ kura history --chain 11155111 --limit 50
 kura connections      # list active dapp sessions
 kura audit -n 20      # off-chain event log
 kura watch            # live SSE stream of daemon events
+kura wallet list      # manage wallets (also: add | use | remove | show)
 kura install-shim     # (re)install the qutebrowser userscript
 ```
 
+`kura wallet add <name>` accepts `--generate`, `--import-key <hex|->`, `--watch-only <0x...>`, `--default`. Without flags it prompts interactively. `kura wallet use <name>` (alias `switch`) sets the default. `kura wallet remove <name> [--purge-key] [-y]` drops the wallet (and optionally its Keychain entry); the next remaining wallet becomes default.
+
 ## TUI keys (home view)
 
-`s` send · `r` receive (QR) · `h` history · `c` connections · `w` watch · `tab` cycle chain · `n` mainnet/testnet toggle · `g` refresh · `q` quit · `esc` back from any modal
+`s` send · `r` receive (QR) · `h` history · `c` connections · `w` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `g` refresh · `q` quit · `esc` back from any modal
 
 ## Architecture
 

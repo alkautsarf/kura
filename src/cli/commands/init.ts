@@ -2,18 +2,17 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile, chmod } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { generatePrivateKey, privateKeyToAccount, mnemonicToAccount } from "viem/accounts";
+import { mnemonicToAccount } from "viem/accounts";
 import { COLOR } from "../format.ts";
-import { ask, askSecret, confirm, choose } from "../prompt.ts";
+import { ask, askSecret, confirm, choose, readStdin } from "../prompt.ts";
 import { KURA_HOME } from "../../core/paths.ts";
-import { DEFAULT_CONFIG, ensureKuraHome, upsertWallet, writeConfig, getWallet } from "../../core/config.ts";
+import { DEFAULT_CONFIG, ensureKuraHome, writeConfig, getWallet } from "../../core/config.ts";
 import { getOrCreateSecret } from "../../core/secret.ts";
 import {
   walletService,
   writePassword,
   exists,
   walletExists,
-  writeWalletKey,
   signerAvailable,
   readAlchemyKey,
   readEnvioToken,
@@ -22,9 +21,15 @@ import {
   SVC_ENVIO,
   SVC_TENDERLY,
 } from "../../core/keychain.ts";
+import {
+  createGeneratedWallet,
+  createImportedWallet,
+  createWatchOnlyWallet,
+  createSharedKeychainWallet,
+} from "../../core/wallet.ts";
 import { installShim } from "../../shim/install.ts";
 import { BUNDLED_CHAINS } from "../../core/chains.ts";
-import type { Address, KuraConfig, WalletProfile, WalletSource } from "../../core/types.ts";
+import type { Address, KuraConfig, WalletProfile } from "../../core/types.ts";
 
 interface RunArgs {
   name?: string;
@@ -53,7 +58,6 @@ export async function run(args: RunArgs): Promise<void> {
   console.log(`\nstep 3/8: wallet`);
   const walletName = args.name ?? (await ask("wallet name", "main"));
   const profile = await setupWallet(walletName, args);
-  await upsertWallet(profile);
   console.log(`${COLOR.green}OK${COLOR.reset} wallet ${walletName}: ${profile.address}`);
 
   console.log(`\nstep 4/8: keychain entry`);
@@ -176,91 +180,50 @@ async function setupWallet(name: string, args: RunArgs): Promise<WalletProfile> 
     console.log(`${COLOR.yellow}NOTE${COLOR.reset} kura-signer (Touch ID) not built. Wallet keys will use plain Keychain (password prompt instead of Touch ID). Build with: cd swift && swift build -c release`);
   }
 
-  let source: WalletSource = "generated";
-  let address: Address;
-  let privateKey: string;
-
   if (args.importKey) {
-    if (args.importKey === "-") {
-      // Read from stdin so the key never appears in `ps` output
-      privateKey = (await new Promise<string>((resolve) => {
-        let buf = "";
-        process.stdin.on("data", (chunk) => (buf += chunk.toString()));
-        process.stdin.on("end", () => resolve(buf.trim()));
-      }));
-    } else {
-      privateKey = args.importKey;
-    }
-    address = privateKeyToAccount((privateKey.startsWith("0x") ? privateKey : "0x" + privateKey) as `0x${string}`).address;
-    source = "imported-private-key";
-  } else if (args.importSeed) {
-    const account = mnemonicToAccount(args.importSeed);
-    address = account.address;
-    privateKey = "(seed-derived)";
+    const hex = args.importKey === "-" ? await readStdin() : args.importKey;
+    return (await createImportedWallet(name, hex)).profile;
+  }
+  if (args.importSeed) {
+    // Derive address up-front to surface bad seed early; storage path TBD.
+    mnemonicToAccount(args.importSeed);
     throw new Error("seed import requires deriving private key, not implemented for stdin yet; use --import-key");
-  } else if (args.watchOnly) {
-    return {
-      name,
-      address: args.watchOnly as Address,
-      createdAt: new Date().toISOString(),
-      watchOnly: true,
-      source: "watch-only",
-    };
-  } else {
-    const choice = await choose("how do you want to set up the wallet?", [
-      { label: "generate new (random)", value: "generate" },
-      { label: "import private key (paste)", value: "key" },
-      { label: "import seed phrase (paste)", value: "seed" },
-      { label: "watch-only address", value: "watch" },
-      { label: "use existing keychain item", value: "keychain" },
-    ]);
-    if (choice === "watch") {
-      const addr = await ask("address (0x...)");
-      return {
-        name,
-        address: addr as Address,
-        createdAt: new Date().toISOString(),
-        watchOnly: true,
-        source: "watch-only",
-      };
-    }
-    if (choice === "keychain") {
-      const svc = await ask("keychain service (e.g., xyz.pragma.kura)");
-      const acct = await ask("account", "key");
-      const { readPassword } = await import("../../core/keychain.ts");
-      const key = await readPassword(svc, acct);
-      if (!key) throw new Error(`keychain entry ${svc}/${acct} not found`);
-      const addr = privateKeyToAccount((key.startsWith("0x") ? key : "0x" + key) as `0x${string}`).address;
-      return {
-        name,
-        address: addr,
-        createdAt: new Date().toISOString(),
-        watchOnly: false,
-        source: "keychain-shared",
-        keychainService: svc,
-      };
-    }
-    if (choice === "generate") {
-      privateKey = generatePrivateKey();
-      address = privateKeyToAccount(privateKey as `0x${string}`).address;
-      source = "generated";
-      console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} new wallet generated. address: ${address}`);
-      console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} private key WILL be stored in macOS Keychain only.`);
-      console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} Keychain is NOT a backup. Write down the key NOW:`);
-      console.log(`  ${COLOR.bold}${privateKey}${COLOR.reset}`);
-      const ack = await confirm("backed up?", false);
-      if (!ack) throw new Error("backup not confirmed; aborting");
-    } else if (choice === "key") {
-      privateKey = (await askSecret("private key (0x...)")).trim();
-      address = privateKeyToAccount((privateKey.startsWith("0x") ? privateKey : "0x" + privateKey) as `0x${string}`).address;
-      source = "imported-private-key";
-    } else {
-      throw new Error("seed phrase import not implemented in v0.1; use private key");
-    }
+  }
+  if (args.watchOnly) {
+    return (await createWatchOnlyWallet(name, args.watchOnly as Address)).profile;
   }
 
-  await writeWalletKey(name, privateKey);
-  return { name, address, createdAt: new Date().toISOString(), watchOnly: false, source };
+  const choice = await choose("how do you want to set up the wallet?", [
+    { label: "generate new (random)", value: "generate" },
+    { label: "import private key (paste)", value: "key" },
+    { label: "import seed phrase (paste)", value: "seed" },
+    { label: "watch-only address", value: "watch" },
+    { label: "use existing keychain item", value: "keychain" },
+  ]);
+  if (choice === "watch") {
+    const addr = await ask("address (0x...)");
+    return (await createWatchOnlyWallet(name, addr as Address)).profile;
+  }
+  if (choice === "keychain") {
+    const svc = await ask("keychain service (e.g., xyz.pragma.kura)");
+    const acct = await ask("account", "key");
+    return (await createSharedKeychainWallet(name, svc, acct)).profile;
+  }
+  if (choice === "generate") {
+    const result = await createGeneratedWallet(name);
+    console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} new wallet generated. address: ${result.profile.address}`);
+    console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} private key WILL be stored in macOS Keychain only.`);
+    console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} Keychain is NOT a backup. Write down the key NOW:`);
+    console.log(`  ${COLOR.bold}${result.privateKey}${COLOR.reset}`);
+    const ack = await confirm("backed up?", false);
+    if (!ack) throw new Error("backup not confirmed; aborting");
+    return result.profile;
+  }
+  if (choice === "key") {
+    const hex = (await askSecret("private key (0x...)")).trim();
+    return (await createImportedWallet(name, hex)).profile;
+  }
+  throw new Error("seed phrase import not implemented in v0.1; use private key");
 }
 
 async function ensureServiceKeys(): Promise<void> {

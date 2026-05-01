@@ -2,7 +2,7 @@
 // kura - wallet terminal entry point
 // Routes by argv[0] subcommand to: tui (default), cli, daemon, popup, init, install-shim, audit, watch.
 
-const VERSION = "0.1.4";
+const VERSION = "0.1.5";
 
 const args = process.argv.slice(2);
 const subcommand = args[0];
@@ -33,6 +33,7 @@ async function main() {
     case "connections":
     case "audit":
     case "watch":
+    case "wallet":
     case "proxy": {
       const { run: runCli } = await import("./cli/index.ts");
       return runCli(args);
@@ -57,6 +58,7 @@ Usage:
   kura connections           list dapp connections
   kura audit                 inspect off-chain event log
   kura watch                 stream daemon SSE events
+  kura wallet                manage wallets (list / add / use / remove / show)
   kura install-shim          (re)install qutebrowser userscript
   kura daemon                run as background daemon
   kura proxy                 run csp-strip HTTPS proxy (also auto-started by daemon if enabled in config)
