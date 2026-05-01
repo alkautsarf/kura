@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14] - 2026-05-01
+
+### Fixed
+- Approval popup never appeared when daemon was started under launchd (`brew services start kura`). Daemon's popup spawn checked `process.env.TMUX` and only ran `tmux display-popup` if it was set; under launchd that env var is empty, so dapp connect/sign requests went into the queue with no UI ever surfacing — user saw the dapp's spinner forever and nothing else. Fix: when `$TMUX` is missing, daemon now queries `tmux list-sessions` to find the attached session and passes it as `-t <session>` to `display-popup`. Falls back to "queued only" warning only when no tmux server is reachable at all (genuine no-tmux environment). Regression introduced when daemon migrated to launchd autostart in v0.1.10's brew services integration.
+
+[0.1.14]: https://github.com/alkautsarf/kura/releases/tag/v0.1.14
+
 ## [0.1.13] - 2026-05-01
 
 ### Fixed

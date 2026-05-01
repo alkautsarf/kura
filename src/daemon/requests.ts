@@ -104,27 +104,55 @@ async function spawnPopup(id: string): Promise<void> {
     }).catch(() => {});
     return;
   }
-  if (process.env.TMUX) {
-    // Steal focus FIRST so Ghostty is foregrounded by the time the popup
-    // renders inside it. Calling activate after spawn races: tmux sometimes
-    // shows the popup before macOS finishes the activate, leaving qb on top.
-    focusTerminalApp().catch((err) => console.warn(`[daemon] focus failed: ${err.message}`));
-    // -B = no tmux popup border (the inner opentui box already draws one).
-    // -w/-h = popup size as % of pane.
+  // Resolve tmux target. When daemon was started inside tmux (manual launch),
+  // $TMUX is set and tmux uses it as implicit target. When started under
+  // launchd / brew services, $TMUX is empty — discover the attached session
+  // by querying the tmux server directly. Without explicit -t, display-popup
+  // would fail silently with no client attached.
+  const extraArgs: string[] = [];
+  if (!process.env.TMUX) {
+    const session = await findAttachedTmuxSession();
+    if (!session) {
+      console.warn(`[daemon] no tmux server reachable, popup queued only: ${popupCmd}`);
+      return;
+    }
+    extraArgs.push("-t", session);
+  }
+  // Steal focus FIRST so Ghostty is foregrounded by the time the popup
+  // renders inside it. Calling activate after spawn races: tmux sometimes
+  // shows the popup before macOS finishes the activate, leaving qb on top.
+  focusTerminalApp().catch((err) => console.warn(`[daemon] focus failed: ${err.message}`));
+  // -B = no tmux popup border (the inner opentui box already draws one).
+  // -w/-h = popup size as % of pane.
+  const proc = spawn({
+    cmd: ["tmux", "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "50%", ...extraArgs, popupCmd],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.exited.then(async (code) => {
+    if (code !== 0) {
+      const err = await new Response(proc.stderr).text();
+      console.warn(`[daemon] popup ${id.slice(0, 8)} exit ${code}: ${err.slice(0, 200)} (also see ${logFile})`);
+    }
+  }).catch(() => {});
+}
+
+async function findAttachedTmuxSession(): Promise<string | null> {
+  try {
     const proc = spawn({
-      cmd: ["tmux", "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "50%", popupCmd],
+      cmd: ["tmux", "list-sessions", "-F", "#{session_name} #{?session_attached,attached,detached}"],
       stdout: "pipe",
       stderr: "pipe",
     });
-    proc.exited.then(async (code) => {
-      if (code !== 0) {
-        const err = await new Response(proc.stderr).text();
-        console.warn(`[daemon] popup ${id.slice(0, 8)} exit ${code}: ${err.slice(0, 200)} (also see ${logFile})`);
-      }
-    }).catch(() => {});
-    return;
+    if ((await proc.exited) !== 0) return null;
+    const text = await new Response(proc.stdout).text();
+    const lines = text.trim().split("\n").filter(Boolean);
+    if (lines.length === 0) return null;
+    const attached = lines.find((l) => l.endsWith("attached"));
+    return (attached ?? lines[0])!.split(" ")[0] ?? null;
+  } catch {
+    return null;
   }
-  console.warn(`[daemon] no $TMUX in environment, popup queued only: ${popupCmd}`);
 }
 
 // Bring the terminal emulator that hosts tmux to the foreground so the user
