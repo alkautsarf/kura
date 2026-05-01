@@ -37,6 +37,16 @@ const patches = [
     find: "const transforms = await (transformAsync.default || transformAsync)(code, {",
     replace: "const transforms = await (typeof transformAsync==='function'?transformAsync:transformAsync.default||transformAsync.transformAsync)(code, {",
   },
+  // @babel/helper-replace-supers destructures `assignmentExpression`, etc.
+  // from `_core.types`. bun --compile wraps `_core` as a namespace object so
+  // `_core.types` resolves to undefined and the destructure throws "Cannot
+  // destructure property 'assignmentExpression' from null or undefined value".
+  // Unwrap with the same multi-level fallback pattern.
+  {
+    file: "node_modules/@babel/helper-replace-supers/lib/index.js",
+    find: "} = _core.types;",
+    replace: "} = _core.types || (_core.default && _core.default.types) || {};",
+  },
 ];
 
 let applied = 0;
