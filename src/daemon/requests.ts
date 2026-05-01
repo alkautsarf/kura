@@ -1,9 +1,21 @@
 import { spawn } from "bun";
+import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { PendingRequest, RiskResult, SimulationResult } from "../core/types.ts";
 import { emit } from "./events.ts";
 import { logAudit } from "../core/audit-log.ts";
 import { resolveSelfBinary, isCompiledBinary } from "../core/self-binary.ts";
+
+// When daemon is started under launchd / brew services, PATH is bare
+// (/usr/bin:/bin:/usr/sbin:/sbin) and Homebrew binaries like tmux aren't
+// reachable. Resolve tmux's absolute path once at module load. Falls back
+// to "tmux" if none of the standard paths exist (assumes PATH-resolvable).
+const TMUX_BIN = (() => {
+  for (const p of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
+    if (existsSync(p)) return p;
+  }
+  return "tmux";
+})();
 
 export type Decision = "approve" | "reject" | "timeout";
 
@@ -92,7 +104,7 @@ async function spawnPopup(id: string): Promise<void> {
   const targetPane = process.env.KURA_POPUP_PANE;
   if (targetPane) {
     const proc = spawn({
-      cmd: ["tmux", "send-keys", "-t", targetPane, `clear; ${popupCmd}`, "Enter"],
+      cmd: [TMUX_BIN, "send-keys", "-t", targetPane, `clear; ${popupCmd}`, "Enter"],
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -125,7 +137,7 @@ async function spawnPopup(id: string): Promise<void> {
   // -B = no tmux popup border (the inner opentui box already draws one).
   // -w/-h = popup size as % of pane.
   const proc = spawn({
-    cmd: ["tmux", "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "50%", ...extraArgs, popupCmd],
+    cmd: [TMUX_BIN, "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "50%", ...extraArgs, popupCmd],
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -140,7 +152,7 @@ async function spawnPopup(id: string): Promise<void> {
 async function findAttachedTmuxSession(): Promise<string | null> {
   try {
     const proc = spawn({
-      cmd: ["tmux", "list-sessions", "-F", "#{session_name} #{?session_attached,attached,detached}"],
+      cmd: [TMUX_BIN, "list-sessions", "-F", "#{session_name} #{?session_attached,attached,detached}"],
       stdout: "pipe",
       stderr: "pipe",
     });

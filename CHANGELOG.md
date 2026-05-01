@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.15] - 2026-05-01
+
+### Fixed
+- v0.1.14's "discover tmux session" popup fix didn't actually work because the launchd-started daemon has `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — `/opt/homebrew/bin` is missing, so spawning `tmux` failed silently before it could run `list-sessions`. Daemon then logged "no tmux server reachable" even though the user had tmux running. Real fix: resolve `tmux` to its absolute path at module load (`/opt/homebrew/bin/tmux` first, then `/usr/local/bin/tmux`, then `/usr/bin/tmux`, finally PATH-resolved fallback). All `spawn(["tmux", ...])` callsites in `src/daemon/requests.ts` now use the resolved `TMUX_BIN`. Verified locally with launchd-equivalent env (no `$TMUX`, no `/opt/homebrew/bin` in PATH).
+
+[0.1.15]: https://github.com/alkautsarf/kura/releases/tag/v0.1.15
+
 ## [0.1.14] - 2026-05-01
 
 ### Fixed

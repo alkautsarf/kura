@@ -1,6 +1,6 @@
 {
   "name": "kura",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Wallet terminal for EVM. Daemon + tmux popup + 4 IO surfaces.",
   "type": "module",
   "private": true,
