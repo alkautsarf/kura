@@ -27,7 +27,7 @@ jobs:
         with:
           bun-download-url: ${{ matrix.target == 'darwin-arm64' && 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.12/bun-darwin-aarch64.zip' || 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.12/bun-linux-x64.zip' }}
 
-      - run: bun install
+      - run: bun install --frozen-lockfile
 
       - name: Compile binary
         run: bun build.ts bun-${{ matrix.target }} kura-${{ matrix.target }}
