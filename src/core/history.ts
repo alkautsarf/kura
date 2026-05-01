@@ -1,6 +1,8 @@
-import type { ActivityItem, Address } from "./types.ts";
+import type { ActivityItem, Address, Hex } from "./types.ts";
 import { getKnownChain } from "./chains.ts";
 import { readEnvioToken } from "./keychain.ts";
+import { getTokenMeta, getContractLabel } from "./token-meta.ts";
+import { describeTx } from "./decode-tx.ts";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
@@ -113,11 +115,23 @@ export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
     if (page.transactions) txs.push(...page.transactions);
     if (page.logs) logs.push(...page.logs);
   }
+  // Track tx hashes that produced ERC20 logs so we can suppress the matching
+  // raw `kind:contract` placeholder (the contract call IS the ERC20 transfer).
+  const txWithErc20Logs = new Set<string>();
+  for (const log of logs) {
+    if (log.transaction_hash) txWithErc20Logs.add(log.transaction_hash.toLowerCase());
+  }
   for (const tx of txs) {
     const from = (tx.from ?? "").toLowerCase();
     const to = (tx.to ?? "").toLowerCase();
     const direction: ActivityItem["direction"] =
       from === me && to === me ? "self" : from === me ? "out" : "in";
+    const isContract = tx.input && tx.input.length > 2;
+    // For incoming contract txs that produced an ERC20 transfer log to us,
+    // the log row already represents the meaningful event. Skip the raw row.
+    if (isContract && direction === "in" && tx.hash && txWithErc20Logs.has(tx.hash.toLowerCase())) {
+      continue;
+    }
     items.push({
       hash: (tx.hash ?? "0x") as `0x${string}`,
       blockNumber: tx.block_number ?? 0,
@@ -126,7 +140,7 @@ export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
       to: tx.to ? (tx.to as Address) : null,
       value: tx.value ?? "0",
       direction,
-      kind: tx.input && tx.input.length > 2 ? "contract" : "native",
+      kind: isContract ? "contract" : "native",
     });
   }
   for (const log of logs) {
@@ -149,5 +163,52 @@ export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
     });
   }
   items.sort((a, b) => b.blockNumber - a.blockNumber);
-  return items.slice(0, limit);
+  // Enrich the top N items with semantic descriptions + token meta so the TUI
+  // can show "approve USDC -> Permit2" instead of "0 ETH" / "tok". Capped to
+  // avoid blowing latency on long histories — anything beyond N renders raw.
+  const sliced = items.slice(0, limit);
+  await enrichItems(q.chainId, sliced, txs);
+  return sliced;
+}
+
+async function enrichItems(chainId: number, items: ActivityItem[], txs: RawTx[]): Promise<void> {
+  const txByHash = new Map<string, RawTx>();
+  for (const tx of txs) {
+    if (tx.hash) txByHash.set(tx.hash.toLowerCase(), tx);
+  }
+  await Promise.all(items.map(async (it) => {
+    if (it.kind === "erc20" && it.token) {
+      const meta = await getTokenMeta(chainId, it.token as Address).catch(() => null);
+      if (meta) {
+        it.symbol = meta.symbol;
+        it.decimals = meta.decimals;
+      }
+      // Spam dust heuristic: incoming ERC20 with no resolvable metadata or
+      // microscopic value (< 1 unit at the resolved decimals) is almost
+      // always airdrop spam. Outgoing dust is the user's own tx, keep.
+      if (it.direction === "in") {
+        const dec = meta?.decimals ?? 18;
+        const minUnit = 10n ** BigInt(Math.max(dec - 6, 0));
+        try {
+          if (BigInt(it.value) < minUnit) it.isDust = true;
+        } catch {
+          it.isDust = true;
+        }
+      }
+      return;
+    }
+    if (it.kind === "contract") {
+      const tx = txByHash.get(it.hash.toLowerCase());
+      const data = (tx?.input ?? "0x") as Hex;
+      const sem = await describeTx({ chainId, to: it.to, data, value: it.value }).catch(() => null);
+      if (sem) {
+        it.description = sem.description;
+        if (sem.token?.symbol) it.symbol = sem.token.symbol;
+        if (sem.token?.decimals) it.decimals = sem.token.decimals;
+      } else if (it.to) {
+        const label = getContractLabel(chainId, it.to);
+        if (label) it.description = `Call ${label}`;
+      }
+    }
+  }));
 }

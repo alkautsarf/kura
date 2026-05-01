@@ -16,10 +16,18 @@ export async function run(args: { chain?: string | number; wallet?: string; addr
   }
   for (const it of items) {
     const arrow = it.direction === "out" ? `${COLOR.red}<-${COLOR.reset}` : it.direction === "in" ? `${COLOR.green}->${COLOR.reset}` : "<>";
-    const amount = it.kind === "erc20" ? `${formatUnits(BigInt(it.value), it.decimals ?? 18)} ${it.symbol ?? "tok"}` : `${formatUnits(BigInt(it.value), 18)} ETH`;
     const counter = it.direction === "out" ? it.to : it.from;
+    const dustTag = it.isDust ? `${COLOR.dim}[dust] ${COLOR.reset}` : "";
+    const left = it.description
+      ? `${dustTag}${it.description}`
+      : (() => {
+          const amount = it.kind === "erc20"
+            ? `${formatUnits(BigInt(it.value), it.decimals ?? 18)} ${it.symbol ?? fmtAddr(it.token, 4)}`
+            : `${formatUnits(BigInt(it.value), 18)} ETH`;
+          return `${dustTag}${arrow} ${amount}`;
+        })();
     console.log(
-      `  ${COLOR.dim}#${it.blockNumber.toString().padEnd(10)}${COLOR.reset} ${arrow} ${amount.padEnd(24)} ${COLOR.dim}${fmtAddr(counter)}${COLOR.reset}  ${COLOR.dim}${fmtAddr(it.hash, 4)}${COLOR.reset}`,
+      `  ${COLOR.dim}#${it.blockNumber.toString().padEnd(10)}${COLOR.reset} ${left.padEnd(48)} ${COLOR.dim}${fmtAddr(counter)}${COLOR.reset}  ${COLOR.dim}${fmtAddr(it.hash, 4)}${COLOR.reset}`,
     );
   }
 }

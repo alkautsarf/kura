@@ -1,3 +1,5 @@
+import { withTimeout } from "./promise.ts";
+
 interface TokenSecurityRaw {
   is_honeypot?: string;
   honeypot_with_same_creator?: string;
@@ -38,8 +40,8 @@ function num(v?: string): number | null {
 
 export async function tokenSecurity(chainId: number, contract: string): Promise<TokenSecurity | null> {
   const url = `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${contract.toLowerCase()}`;
-  const resp = await fetch(url);
-  if (!resp.ok) return null;
+  const resp = await withTimeout(fetch(url), 2500, "goplus timeout").catch(() => null);
+  if (!resp || !resp.ok) return null;
   const json = (await resp.json()) as { result?: Record<string, TokenSecurityRaw> };
   const entry = json.result?.[contract.toLowerCase()];
   if (!entry) return null;
@@ -69,8 +71,8 @@ export interface AddressSecurity {
 
 export async function addressSecurity(address: string, chainId = 1): Promise<AddressSecurity | null> {
   const url = `https://api.gopluslabs.io/api/v1/address_security/${address.toLowerCase()}?chain_id=${chainId}`;
-  const resp = await fetch(url);
-  if (!resp.ok) return null;
+  const resp = await withTimeout(fetch(url), 2500, "goplus timeout").catch(() => null);
+  if (!resp || !resp.ok) return null;
   const json = (await resp.json()) as { result?: Record<string, string> };
   const r = json.result;
   if (!r) return null;

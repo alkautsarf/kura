@@ -1,5 +1,6 @@
 import type { Address, DecodedCall, Hex } from "./types.ts";
 import { getClient } from "./rpc.ts";
+import { withTimeout } from "./promise.ts";
 
 const REGISTRY: Address = "0x44691B39d1a75dC4E0A0346CBB15E310e6ED1E86";
 const ENTRIES_SELECTOR: Hex = "0x019b417a";
@@ -25,7 +26,7 @@ export async function lookupSignature(selector: Hex): Promise<string | null> {
 
 async function lookupOpenchain(selector: Hex): Promise<string | null> {
   try {
-    const resp = await fetch(`${OPENCHAIN_LOOKUP}?function=${selector}`);
+    const resp = await withTimeout(fetch(`${OPENCHAIN_LOOKUP}?function=${selector}`), 1000, "openchain timeout");
     if (!resp.ok) return null;
     const j = (await resp.json()) as {
       ok?: boolean;

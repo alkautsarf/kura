@@ -14,3 +14,4 @@ kura-linux-x64
 .18aac9*
 .bun-build
 *.bun-build
+.claude/

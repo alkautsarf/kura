@@ -2,12 +2,13 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Address, PendingRequest, RequestKind } from "../core/types.ts";
 import { getConfig, listSessions, listWallets, removeSession, getWallet } from "../core/config.ts";
 import { loadAllChains, getKnownChain } from "../core/chains.ts";
-import { decide, enqueue, get, list as listPending } from "./requests.ts";
+import { decide, enqueue, enrich, get, list as listPending } from "./requests.ts";
 import { recentEvents, sseStream } from "./events.ts";
 import { readAudit } from "../core/audit-log.ts";
 import { buildPortfolio } from "../core/portfolio.ts";
 import { fetchActivity } from "../core/history.ts";
 import { decodeCalldata } from "../core/decode.ts";
+import { describeTx, type SemanticTx } from "../core/decode-tx.ts";
 import { simulate } from "../core/sim.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
 import { tokenSecurity, addressSecurity } from "../core/goplus.ts";
@@ -89,6 +90,8 @@ export const handleRequestsList: JsonHandler = async () => {
       request: e.request,
       simulation: e.simulation,
       risk: e.risk,
+      semantic: e.semantic,
+      enriched: e.enriched,
     })),
   });
 };
@@ -97,7 +100,13 @@ export const handleRequestGet: JsonHandler = async (_req, url) => {
   const id = url.pathname.split("/").pop()!;
   const entry = get(id);
   if (!entry) return notFound();
-  return json({ request: entry.request, simulation: entry.simulation, risk: entry.risk });
+  return json({
+    request: entry.request,
+    simulation: entry.simulation,
+    risk: entry.risk,
+    semantic: entry.semantic,
+    enriched: entry.enriched,
+  });
 };
 
 interface IncomingRequest {
@@ -137,12 +146,65 @@ export const handleRequestsCreate: JsonHandler = async (req) => {
     payload: { ...body.payload, origin: body.origin },
     createdAt: Date.now(),
   };
-  const meta = await preprocess(body, pending);
-  const result = await enqueue(pending, meta);
+  // Spawn the popup IMMEDIATELY (empty meta) so the user sees something within
+  // ~500ms. Enrichment runs in the background and pushes results in stages so
+  // each piece appears as soon as it's ready instead of waiting for the slowest:
+  //   1) semantic (fast: ABI decode + token meta lookup, ~500ms)
+  //   2) sim (slow: Tenderly full mode, up to 15s for V4 swaps)
+  //   3) risk (depends on sim for sim-failure rule, so chained after sim)
+  // The popup polls /requests/:id and re-renders as each enrich() lands.
+  const enqueuePromise = enqueue(pending);
+  const isWrite = body.kind === "eth_sendTransaction" || body.kind === "batch";
+  const from = body.payload.from ?? ("0x0000000000000000000000000000000000000000" as Address);
+  const to = body.payload.to ?? null;
+  const data = body.payload.data ?? "0x";
+  const value = body.payload.value ?? "0";
+
+  const semanticPromise = isWrite
+    ? describeTx({ chainId: body.chainId, to, data, value }).catch(() => undefined as SemanticTx | undefined)
+    : Promise.resolve(undefined as SemanticTx | undefined);
+  semanticPromise.then((semantic) => {
+    if (semantic) enrich(pending.id, { semantic });
+  });
+
+  const simPromise = isWrite
+    ? simulate({ chainId: body.chainId, from, to, data, value, gas: body.payload.gas }).catch(() => undefined)
+    : Promise.resolve(undefined);
+  simPromise.then((simulation) => {
+    if (simulation) enrich(pending.id, { simulation });
+  });
+
+  const preprocessPromise = (async () => {
+    const cfg = await getConfig();
+    const [simulation, semantic] = await Promise.all([simPromise, semanticPromise]);
+    const riskKind = mapRiskKind(body.kind, data);
+    const risk = await assess({
+      kind: riskKind,
+      chainId: body.chainId,
+      from,
+      to,
+      data,
+      value,
+      origin: body.origin ?? sourceToOrigin(body.source),
+      simulation,
+      config: { safeThresholdUsd: cfg.safeThresholdUsd },
+    }).catch(() => ({ level: "review" as const, findings: [] }));
+    enrich(pending.id, { risk });
+    return { simulation, risk, semantic };
+  })();
+  preprocessPromise.catch((err) => {
+    console.warn(`[daemon] preprocess failed for ${pending.id.slice(0, 8)}: ${(err as Error).message}`);
+  });
+  const result = await enqueuePromise;
   if (result.decision === "approve" && body.kind === "eth_sendTransaction") {
     try {
       const cfg = await getConfig();
       const walletName = (body.payload as { walletName?: string }).walletName ?? cfg.defaultWallet;
+      // Wait for preprocess so we have the human-readable description for the
+      // Touch ID prompt. Typically preprocess completes well before the user
+      // approves, so this is a no-op await.
+      const meta = await preprocessPromise;
+      const description = enrichedDescription(meta.semantic, meta.simulation);
       const { txHash } = await signAndSend({
         walletName,
         chainId: body.chainId,
@@ -150,6 +212,7 @@ export const handleRequestsCreate: JsonHandler = async (req) => {
         data: body.payload.data ?? "0x",
         value: body.payload.value,
         gas: body.payload.gas,
+        description,
       });
       return json({ ...result, txHash });
     } catch (err) {
@@ -197,29 +260,62 @@ export const handleRequestsCreate: JsonHandler = async (req) => {
   return json(result);
 };
 
-async function preprocess(body: IncomingRequest, _pending: PendingRequest) {
-  const cfg = await getConfig();
-  const from = body.payload.from ?? ("0x0000000000000000000000000000000000000000" as Address);
-  const to = body.payload.to ?? null;
-  const data = body.payload.data ?? "0x";
-  const value = body.payload.value ?? "0";
-  const isWrite = body.kind === "eth_sendTransaction" || body.kind === "batch";
-  const sim = isWrite
-    ? await simulate({ chainId: body.chainId, from, to, data, value, gas: body.payload.gas })
-    : undefined;
-  const riskKind = mapRiskKind(body.kind, data);
-  const risk = await assess({
-    kind: riskKind,
-    chainId: body.chainId,
-    from,
-    to,
-    data,
-    value,
-    origin: body.origin ?? sourceToOrigin(body.source),
-    simulation: sim,
-    config: { safeThresholdUsd: cfg.safeThresholdUsd },
-  });
-  return { simulation: sim, risk };
+// Compose a Touch ID reason that's specific even for opaque router calls.
+// `describeTx` produces "Swap via Uniswap V4 Universal Router" because it
+// can't decode V4 commands bytes. Once the simulation lands with predicted
+// balance diffs (OUT/IN), we can upgrade the description to
+// "Swap 0.1 USDC for ~0.0000437 ETH" so the user sees real amounts on the
+// Touch ID prompt.
+function enrichedDescription(
+  semantic: SemanticTx | undefined,
+  simulation: import("../core/types.ts").SimulationResult | undefined,
+): string | undefined {
+  if (!semantic) return undefined;
+  // For decoders that already know amounts (approve/transfer/swapExact*), the
+  // existing description is already specific.
+  if (
+    semantic.kind === "approve" ||
+    semantic.kind === "transfer" ||
+    semantic.kind === "transferFrom" ||
+    semantic.kind === "swap" ||
+    semantic.kind === "permit" ||
+    semantic.kind === "deposit" ||
+    semantic.kind === "withdraw" ||
+    semantic.kind === "native_send"
+  ) {
+    return semantic.description;
+  }
+  // For execute/multicall/contract on routers, infer amounts from sim diffs.
+  if (!simulation?.ok || !simulation.diffs || simulation.diffs.length < 2) {
+    return semantic.description;
+  }
+  const out = simulation.diffs.find((d) => d.delta.startsWith("-"));
+  const inn = simulation.diffs.find((d) => !d.delta.startsWith("-") && d.delta !== "0");
+  if (!out || !inn) return semantic.description;
+  // Compact format: "0.0000437" not "0.000043768020360712" — Touch ID needs
+  // glanceable amounts, full precision lives in the popup overview.
+  const fmt = (raw: string, decimals: number, sigFigs = 4): string => {
+    let big = BigInt(raw);
+    const sign = big < 0n ? "-" : "";
+    if (big < 0n) big = -big;
+    const div = 10n ** BigInt(decimals);
+    const whole = big / div;
+    const frac = big % div;
+    if (whole > 0n) {
+      const wholeStr = whole.toString();
+      const remaining = Math.max(0, sigFigs - wholeStr.length);
+      if (remaining === 0) return sign + wholeStr;
+      const fracStr = frac.toString().padStart(decimals, "0").slice(0, remaining).replace(/0+$/, "");
+      return fracStr.length > 0 ? `${sign}${wholeStr}.${fracStr}` : sign + wholeStr;
+    }
+    const fracStr = frac.toString().padStart(decimals, "0");
+    const firstNonZero = fracStr.search(/[1-9]/);
+    if (firstNonZero === -1) return sign + "0";
+    const truncated = fracStr.slice(0, firstNonZero + sigFigs).replace(/0+$/, "");
+    return `${sign}0.${truncated}`;
+  };
+  const venue = semantic.contract?.label ? ` on ${semantic.contract.label}` : "";
+  return `Swap ${fmt(out.delta, out.decimals)} ${out.symbol} for ~${fmt(inn.delta, inn.decimals)} ${inn.symbol}${venue}`;
 }
 
 function mapRiskKind(kind: RequestKind, data: `0x${string}`): "send" | "swap" | "approve" | "connect" | "sign" | "switch_chain" | "batch" | "other" {
@@ -365,6 +461,74 @@ export const handleDecode: JsonHandler = async (req) => {
   }
   const decoded = await decodeCalldata(body.to, body.data);
   return json(decoded);
+};
+
+// Allowlisted RPC methods that the shim's eth_* catch-all may proxy through
+// /rpc. Read-only only — write methods (eth_sendTransaction, etc.) MUST go
+// through /requests so they hit the approval flow and signing logic. Anything
+// not on this list is rejected with -32601.
+const ALLOWED_RPC_METHODS: Set<string> = new Set([
+  "eth_chainId",
+  "eth_blockNumber",
+  "eth_call",
+  "eth_estimateGas",
+  "eth_gasPrice",
+  "eth_feeHistory",
+  "eth_maxPriorityFeePerGas",
+  "eth_getBalance",
+  "eth_getCode",
+  "eth_getStorageAt",
+  "eth_getLogs",
+  "eth_getBlockByNumber",
+  "eth_getBlockByHash",
+  "eth_getTransactionByHash",
+  "eth_getTransactionReceipt",
+  "eth_getTransactionCount",
+  "eth_syncing",
+  "eth_protocolVersion",
+  "eth_subscribe",
+  "eth_unsubscribe",
+  "net_version",
+  "net_listening",
+  "web3_clientVersion",
+]);
+
+interface RpcProxyBody {
+  method: string;
+  params?: unknown[];
+  id?: number | string;
+}
+
+export const handleRpcProxy: JsonHandler = async (req, url) => {
+  if (req.method !== "POST") return badRequest("POST only");
+  const chainParam = url.searchParams.get("chain");
+  const chainId = chainParam ? Number(chainParam) : NaN;
+  if (!Number.isFinite(chainId) || chainId <= 0) return badRequest("chain query param required");
+  let body: RpcProxyBody;
+  try {
+    body = (await req.json()) as RpcProxyBody;
+  } catch {
+    return badRequest("invalid JSON body");
+  }
+  const method = body.method;
+  if (!method || typeof method !== "string") {
+    return json({ error: { code: -32600, message: "method required" } });
+  }
+  if (!ALLOWED_RPC_METHODS.has(method)) {
+    return json({ error: { code: -32601, message: `kura: method ${method} not allowed via /rpc` } });
+  }
+  if (!getKnownChain(chainId) && !(await chainHotloaded(chainId))) {
+    return json({ error: { code: -32602, message: `unknown chain ${chainId}` } });
+  }
+  try {
+    const client = await getClient(chainId);
+    // viem's client.request takes { method, params } and returns the raw RPC result
+    const result = await client.request({ method, params: body.params } as never);
+    return json({ result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return json({ error: { code: -32603, message: msg } });
+  }
 };
 
 interface RiskReq {

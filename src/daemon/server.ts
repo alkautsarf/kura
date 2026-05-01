@@ -25,6 +25,7 @@ import {
   handleSimulate,
   handleDecode,
   handleRisk,
+  handleRpcProxy,
 } from "./handlers.ts";
 
 interface Route {
@@ -54,6 +55,11 @@ const ROUTES: Route[] = [
   { method: "POST", pattern: /^\/simulate$/, handler: handleSimulate, authRequired: true },
   { method: "POST", pattern: /^\/decode$/, handler: handleDecode, authRequired: true },
   { method: "POST", pattern: /^\/risk$/, handler: handleRisk, authRequired: true },
+  // /rpc proxies allowlisted read-only eth_* methods to the chain's RPC.
+  // The shim's catch-all hits this for eth_blockNumber, eth_call, etc.
+  // Write methods (eth_sendTransaction) are NOT allowed here — they go
+  // through /requests so they hit the approval + signing flow.
+  { method: "POST", pattern: /^\/rpc$/, handler: handleRpcProxy, authRequired: true },
 ];
 
 export interface DaemonHandle {

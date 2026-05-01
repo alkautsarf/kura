@@ -5,6 +5,7 @@ import { formatUnits, parseUnits, isAddress } from "viem";
 // @ts-expect-error qrcode-terminal has no types
 import qrcode from "qrcode-terminal";
 import { KURA_HOME } from "../core/paths.ts";
+import { fmtAddr } from "../cli/format.ts";
 import { getConfig, getWallet, isBiometryMigrated, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
@@ -127,12 +128,6 @@ function fmtAge(ts: number): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
-}
-
-function fmtAddr(a?: string | null, len = 6): string {
-  if (!a) return "-";
-  if (a.length <= len * 2 + 2) return a;
-  return `${a.slice(0, len + 2)}...${a.slice(-len)}`;
 }
 
 function qrLines(text: string): Promise<string[]> {
@@ -386,7 +381,8 @@ function HomeView(props: {
   history: { items: ActivityItem[] } | undefined;
   chain: KuraChainConfig | undefined;
 }) {
-  const items = () => props.history?.items?.slice(0, 8) ?? [];
+  // Hide isDust spam from the home view (kura history shows them separately).
+  const items = () => (props.history?.items ?? []).filter((it) => !it.isDust).slice(0, 8);
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
   createEffect(() => {
     const list = items();
@@ -403,6 +399,10 @@ function HomeView(props: {
       setResolved((prev) => ({ ...prev, ...next }));
     });
   });
+  // Visible portfolio: priced tokens + unverified, never spam. Counts hidden.
+  const visibleTokens = () => (props.portfolio?.tokens ?? []).filter((t) => !t.spam).slice(0, 8);
+  const hiddenCount = () => (props.portfolio?.tokens ?? []).filter((t) => t.spam).length;
+  const dustCount = () => (props.history?.items ?? []).filter((it) => it.isDust).length;
   return (
     <box flexDirection="column">
       <box marginTop={1} flexDirection="column">
@@ -414,11 +414,18 @@ function HomeView(props: {
         </box>
         <Show when={props.portfolio}>
           <box marginTop={1} flexDirection="column">
-            <For each={props.portfolio!.tokens.slice(0, 8)}>
-              {(t) => (
-                <text>{`  ${t.symbol.padEnd(8)} ${fmtTok(t.balance, t.decimals).padStart(14)}  ${fmtUsd(t.usd).padStart(10)}  ${(t.pct ?? 0).toFixed(1)}%`}</text>
-              )}
+            <For each={visibleTokens()}>
+              {(t) => {
+                const tag = t.unverified ? "  [unverified]" : "";
+                const rowColor = t.unverified ? "#666" : undefined;
+                return (
+                  <text fg={rowColor}>{`  ${t.symbol.padEnd(8)} ${fmtTok(t.balance, t.decimals).padStart(14)}  ${fmtUsd(t.usd).padStart(10)}  ${(t.pct ?? 0).toFixed(1)}%${tag}`}</text>
+                );
+              }}
             </For>
+            <Show when={hiddenCount() > 0}>
+              <text fg="#666">{`  + ${hiddenCount()} spam token${hiddenCount() === 1 ? "" : "s"} hidden`}</text>
+            </Show>
           </box>
         </Show>
       </box>
@@ -430,16 +437,26 @@ function HomeView(props: {
               {(it) => {
                 const arrow = it.direction === "out" ? "<-" : it.direction === "in" ? "->" : "<>";
                 const rowColor = it.direction === "out" ? "#ff8c66" : it.direction === "in" ? "#a3be8c" : "#888";
-                const symbol = it.kind === "erc20" ? (it.symbol ?? "tok") : (props.chain?.symbol ?? "ETH");
-                const dec = it.kind === "erc20" ? it.decimals : 18;
-                const amount = fmtActivityAmount(it.value, dec, symbol);
                 const counter = it.direction === "out" ? it.to : it.from;
                 const name = counter ? resolved()[counter.toLowerCase()] : null;
                 const counterDisplay = name ?? fmtAddr(counter);
-                const line = `  #${it.blockNumber.toString().padEnd(10)} ${arrow} ${amount.padEnd(28).slice(0, 28)}  ${counterDisplay}`.padEnd(100).slice(0, 100);
+                // Decoded contract calls and ERC20 transfers with semantics
+                // get the description; raw native sends still get the
+                // arrow + amount + symbol layout.
+                const left = it.description
+                  ? it.description
+                  : (() => {
+                      const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
+                      const dec = it.kind === "erc20" ? it.decimals : 18;
+                      return `${arrow} ${fmtActivityAmount(it.value, dec, symbol)}`;
+                    })();
+                const line = `  #${it.blockNumber.toString().padEnd(10)} ${left.padEnd(48).slice(0, 48)}  ${counterDisplay}`.padEnd(110).slice(0, 110);
                 return <text fg={rowColor}>{line}</text>;
               }}
             </For>
+            <Show when={dustCount() > 0}>
+              <text fg="#666">{`  + ${dustCount()} dust/spam tx${dustCount() === 1 ? "" : "s"} hidden`}</text>
+            </Show>
           </Show>
         </box>
       </box>
@@ -602,6 +619,8 @@ function ReceiveModal(props: { wallet: WalletProfile; chain: KuraChainConfig | u
 
 function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | undefined }) {
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
+  // History view shows everything including dust (with a [dust] tag) so the
+  // user can audit; only HomeView hides them outright.
   createEffect(() => {
     const list = props.items;
     Promise.all(
@@ -631,14 +650,20 @@ function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | un
           <For each={visible()}>
             {(it) => {
               const arrow = it.direction === "out" ? "<-" : it.direction === "in" ? "->" : "<>";
-              const rowColor = it.direction === "out" ? "#ff8c66" : it.direction === "in" ? "#a3be8c" : "#888";
-              const symbol = it.kind === "erc20" ? (it.symbol ?? "tok") : (props.chain?.symbol ?? "ETH");
-              const dec = it.kind === "erc20" ? it.decimals : 18;
-              const amount = fmtActivityAmount(it.value, dec, symbol);
+              const baseColor = it.direction === "out" ? "#ff8c66" : it.direction === "in" ? "#a3be8c" : "#888";
+              const rowColor = it.isDust ? "#666" : baseColor;
               const counter = it.direction === "out" ? it.to : it.from;
               const name = counter ? resolved()[counter.toLowerCase()] : null;
               const counterDisplay = name ?? fmtAddr(counter);
-              const line = `  #${it.blockNumber.toString().padEnd(10)} ${arrow} ${amount.padEnd(28).slice(0, 28)}  ${counterDisplay.padEnd(28).slice(0, 28)}  ${fmtAddr(it.hash, 4)}`.padEnd(120).slice(0, 120);
+              const left = it.description
+                ? `${it.isDust ? "[dust] " : ""}${it.description}`
+                : (() => {
+                    const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
+                    const dec = it.kind === "erc20" ? it.decimals : 18;
+                    const tag = it.isDust ? "[dust] " : "";
+                    return `${tag}${arrow} ${fmtActivityAmount(it.value, dec, symbol)}`;
+                  })();
+              const line = `  #${it.blockNumber.toString().padEnd(10)} ${left.padEnd(48).slice(0, 48)}  ${counterDisplay.padEnd(28).slice(0, 28)}  ${fmtAddr(it.hash, 4)}`.padEnd(130).slice(0, 130);
               return <text fg={rowColor}>{line}</text>;
             }}
           </For>

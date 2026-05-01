@@ -1,22 +1,44 @@
+import { spawn } from "bun";
 import { render, useKeyboard, useRenderer } from "@opentui/solid";
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
-import { decodeFunctionData, parseAbi, hexToString } from "viem";
+import { hexToString } from "viem";
 import type { PendingRequest, RiskFinding, RiskLevel, RiskResult, SimulationResult } from "../core/types.ts";
+import type { SemanticTx } from "../core/decode-tx.ts";
+import { describeTypedData } from "../core/decode-tx.ts";
+import { fmtAddr } from "../cli/format.ts";
+import { getKnownChain } from "../core/chains.ts";
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
-import { decodeCalldata } from "../core/decode.ts";
 import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
 
 interface PendingDetail {
   request: PendingRequest;
   simulation?: SimulationResult;
   risk?: RiskResult;
+  semantic?: SemanticTx;
+  enriched?: boolean;
 }
 
+interface FeeData {
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+}
+
+const COLORS = {
+  label: "#aaaaaa",
+  value: "#e0e0e0",
+  accent: "#88c0d0",
+  ok: "#3ddc84",
+  warn: "#ffc857",
+  bad: "#ff5252",
+  dim: "#888888",
+};
+
 const LEVEL_COLORS: Record<RiskLevel, string> = {
-  safe: "#3ddc84",
-  review: "#ffc857",
-  danger: "#ff5252",
+  safe: COLORS.ok,
+  review: COLORS.warn,
+  danger: COLORS.bad,
 };
 
 const LEVEL_LABEL: Record<RiskLevel, string> = {
@@ -25,73 +47,129 @@ const LEVEL_LABEL: Record<RiskLevel, string> = {
   danger: "DANGER",
 };
 
-const COMMON_ABI = parseAbi([
-  "function transfer(address to, uint256 amount)",
-  "function transferFrom(address from, address to, uint256 amount)",
-  "function approve(address spender, uint256 amount)",
-  "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)",
-  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)",
-  "function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline)",
-  "function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96))",
-  "function exactInput((bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum))",
-  "function deposit()",
-  "function withdraw(uint256 wad)",
-  "function multicall(bytes[] data)",
-]);
-
-interface DecodedArgs {
-  fnName?: string;
-  args?: unknown[];
-  signature?: string;
-  selector: string;
-}
-
-function decodeArgs(data: `0x${string}`, parityFn: string | undefined): DecodedArgs {
-  const selector = data.slice(0, 10);
-  if (data === "0x" || data.length < 10) return { selector };
-  try {
-    const decoded = decodeFunctionData({ abi: COMMON_ABI, data });
-    return {
-      fnName: decoded.functionName,
-      args: decoded.args as unknown as unknown[],
-      signature: parityFn,
-      selector,
-    };
-  } catch {
-    return { selector, signature: parityFn };
-  }
-}
-
-function fmtArg(arg: unknown): string {
-  if (arg === null || arg === undefined) return "(null)";
-  if (typeof arg === "bigint") return arg.toString();
-  if (typeof arg === "string") return arg.length > 80 ? `${arg.slice(0, 60)}…` : arg;
-  if (Array.isArray(arg)) return `[${arg.map(fmtArg).join(", ")}]`;
-  if (typeof arg === "object") {
-    return JSON.stringify(arg, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
-  }
-  return String(arg);
-}
+type View = "outcome" | "calldata" | "expanded";
 
 interface PopupProps {
-  detail: PendingDetail;
-  decoded: DecodedArgs;
+  initial: PendingDetail;
+  fetchLatest: () => Promise<PendingDetail | null>;
+  fetchFees: (chainId: number) => Promise<FeeData | null>;
   onDecide: (decision: "approve" | "reject") => Promise<void>;
 }
 
+function cleanSource(src: string): string {
+  // Strip the internal "shim:" / "tui:" / "cli:" prefix; show just the origin.
+  return src.replace(/^(shim|tui|cli|mcp):/, "").replace(/^https?:\/\//, "");
+}
+
+function copyToClipboard(text: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn({ cmd: ["pbcopy"], stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+      p.stdin.write(text);
+      p.stdin.end();
+      p.exited.then((code) => resolve(code === 0)).catch(() => resolve(false));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+function fmtAmt(raw: string | undefined, decimals: number): string {
+  if (!raw) return "?";
+  try {
+    // BigInt division truncates toward zero and `%` carries the sign of the
+    // dividend, so naively splitting -100000 / 10^6 produces "0" + "-1" = "0.-1".
+    // Pull the sign first, format the absolute value, then prepend.
+    const big = BigInt(raw);
+    const sign = big < 0n ? "-" : "";
+    const abs = big < 0n ? -big : big;
+    const div = 10n ** BigInt(decimals);
+    const whole = abs / div;
+    const frac = abs % div;
+    const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+    return fracStr.length > 0 ? `${sign}${whole}.${fracStr}` : `${sign}${whole}`;
+  } catch {
+    return "?";
+  }
+}
+
 function Popup(props: PopupProps) {
-  const [view, setView] = createSignal<"outcome" | "calldata">("outcome");
+  const [view, setView] = createSignal<View>("outcome");
   const [busy, setBusy] = createSignal(false);
   const [status, setStatus] = createSignal<string>("");
+  const [detail, setDetail] = createSignal<PendingDetail>(props.initial);
+  const [typedSummary, setTypedSummary] = createSignal<string>("");
+  const [calldataScroll, setCalldataScroll] = createSignal(0);
+  const [fees, setFees] = createSignal<FeeData | null>(null);
   const renderer = useRenderer();
 
-  // Hand the live renderer to terminal.ts so signal-driven shutdowns
-  // (SIGINT/SIGTERM/SIGHUP routed through quit) can destroy it before
-  // process.exit. See src/core/terminal.ts for the full ordering rationale.
+  // Fetch current network fee data (gas price + EIP-1559 fields) so we can
+  // display gas cost in ETH alongside the gas units. One-shot fetch on mount.
+  onMount(() => {
+    props.fetchFees(props.initial.request.chainId).then((f) => {
+      if (f) setFees(f);
+    }).catch(() => {});
+  });
+
   onMount(() => {
     setActiveRenderer(renderer ?? null);
     onCleanup(() => setActiveRenderer(null));
   });
+
+  // Poll daemon for enrichment updates (sim/risk/semantic land async, in
+  // stages). Each piece arrives separately:
+  //   - semantic: ~500ms (ABI decode + token meta)
+  //   - simulation: 5-15s (Tenderly full-mode is slow on V4 swaps)
+  //   - risk: depends on sim result
+  // Stop polling once all three are present, OR after 60 attempts (~18s).
+  onMount(() => {
+    let attempts = 0;
+    const isComplete = (d: PendingDetail): boolean => {
+      const isWrite = d.request.kind === "eth_sendTransaction" || d.request.kind === "batch";
+      if (!isWrite) return d.risk !== undefined;
+      return d.semantic !== undefined && d.simulation !== undefined && d.risk !== undefined;
+    };
+    if (isComplete(props.initial)) return;
+    const tick = async () => {
+      if (attempts > 60) return;
+      attempts += 1;
+      const next = await props.fetchLatest().catch(() => null);
+      if (next) {
+        setDetail(next);
+        if (isComplete(next)) return;
+      }
+      setTimeout(tick, 300);
+    };
+    setTimeout(tick, 250);
+  });
+
+  // Decode typed-data sign requests asynchronously (semantic decode involves
+  // RPC + token meta lookups), then surface the result above the raw JSON dump.
+  onMount(() => {
+    const d = detail();
+    if (d.request.kind !== "eth_signTypedData_v4") return;
+    const params = ((d.request.payload as { params?: unknown[] }).params ?? []) as unknown[];
+    const j = params[1];
+    if (j === undefined) return;
+    describeTypedData(j, d.request.chainId).then((s) => {
+      if (s?.description) setTypedSummary(s.description);
+    }).catch(() => {});
+  });
+
+  const calldataText = (): string => {
+    const d = detail();
+    if (d.request.kind === "eth_signTypedData_v4") {
+      const params = ((d.request.payload as { params?: unknown[] }).params ?? []) as unknown[];
+      const data = params[1];
+      try {
+        const parsed = typeof data === "string" ? JSON.parse(data) : data;
+        return JSON.stringify(parsed, null, 2);
+      } catch {
+        return String(data ?? "");
+      }
+    }
+    return ((d.request.payload as { data?: string }).data ?? "0x");
+  };
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
@@ -99,86 +177,211 @@ function Popup(props: PopupProps) {
       return;
     }
     if (busy()) return;
+    const v = view();
+    const inCalldata = v === "calldata" || v === "expanded";
     if (key.name === "tab") {
-      setView(view() === "outcome" ? "calldata" : "outcome");
+      // tab cycles outcome <-> calldata; from expanded, returns to outcome.
+      setView(v === "outcome" ? "calldata" : "outcome");
+      setCalldataScroll(0);
+    } else if (inCalldata && key.name === "e") {
+      setView(v === "expanded" ? "calldata" : "expanded");
+    } else if (inCalldata && (key.name === "j" || key.name === "down")) {
+      setCalldataScroll((s) => s + 1);
+    } else if (inCalldata && (key.name === "k" || key.name === "up")) {
+      setCalldataScroll((s) => Math.max(0, s - 1));
+    } else if (inCalldata && key.name === "g") {
+      setCalldataScroll(0);
+    } else if (inCalldata && key.name === "c") {
+      const text = calldataText();
+      copyToClipboard(text).then((ok) => {
+        setStatus(ok ? `copied ${text.length} chars` : "copy failed");
+        setTimeout(() => setStatus(""), 2000);
+      });
     } else if (key.name === "a") {
       setBusy(true);
       setStatus("awaiting Touch ID...");
-      // onDecide returns once the popup→daemon decision POST completes (fast).
-      // The actual Touch ID prompt + sign happen in the daemon process AFTER the
-      // popup is gone. If the user cancels Touch ID, the dapp sees the error;
-      // we can't surface it here because the popup is already exiting.
       props.onDecide("approve").catch((e) => setStatus(`error: ${e.message}`));
-    } else if (key.name === "r" || key.name === "q" || key.name === "escape") {
+    } else if (key.name === "r" || (v === "outcome" && key.name === "q") || key.name === "escape") {
       setBusy(true);
       setStatus("rejected");
       props.onDecide("reject").catch((e) => setStatus(`error: ${e.message}`));
     }
   });
 
-  const risk = (): RiskResult => props.detail.risk ?? { level: "review", findings: [] };
-  const sim = (): SimulationResult | undefined => props.detail.simulation;
-  const kind = () => props.detail.request.kind;
-  const payload = () => (props.detail.request.payload ?? {}) as Record<string, unknown>;
+  const risk = (): RiskResult => detail().risk ?? { level: "review", findings: [] };
+  const sim = (): SimulationResult | undefined => detail().simulation;
+  const semantic = (): SemanticTx | undefined => detail().semantic;
+  const kind = () => detail().request.kind;
+  const payload = () => (detail().request.payload ?? {}) as Record<string, unknown>;
+  const enriched = () => detail().enriched ?? false;
+  const source = () => cleanSource(detail().request.source);
 
   const kindLabel = () => {
     const k = kind();
     if (k === "connect") return "connect";
     if (k === "personal_sign") return "sign message";
     if (k === "eth_signTypedData_v4") return "sign typed data";
-    if (k === "eth_sendTransaction") return "send transaction";
+    if (k === "eth_sendTransaction") {
+      const s = semantic();
+      if (s) return s.kind;
+      return "send";
+    }
     if (k === "batch") return "batch";
     return k;
   };
+
+  const chainInfo = () => {
+    const cid = detail().request.chainId;
+    const c = getKnownChain(cid);
+    return {
+      label: c ? `${c.name} (${cid})` : String(cid),
+      symbol: c?.symbol ?? "ETH",
+    };
+  };
+
   return (
-    <box flexDirection="column" padding={1} width="100%" height="100%">
+    <Show when={view() === "expanded"} fallback={<NormalView
+      view={view()}
+      kindLabel={kindLabel()}
+      detail={detail()}
+      semantic={semantic()}
+      sim={sim()}
+      risk={risk()}
+      kind={kind()}
+      payload={payload()}
+      enriched={enriched()}
+      source={source()}
+      chainLabel={chainInfo().label}
+      chainSymbol={chainInfo().symbol}
+      fees={fees()}
+      typedSummary={typedSummary()}
+      calldataScroll={calldataScroll()}
+      busy={busy()}
+      status={status()}
+    />}>
+      <ExpandedCalldata
+        kindLabel={kindLabel()}
+        kind={kind()}
+        payload={payload()}
+        semantic={semantic()}
+        scroll={calldataScroll()}
+        busy={busy()}
+        status={status()}
+      />
+    </Show>
+  );
+}
+
+interface NormalViewProps {
+  view: View;
+  kindLabel: string;
+  detail: PendingDetail;
+  semantic: SemanticTx | undefined;
+  sim: SimulationResult | undefined;
+  risk: RiskResult;
+  kind: string;
+  payload: Record<string, unknown>;
+  enriched: boolean;
+  source: string;
+  chainLabel: string;
+  chainSymbol: string;
+  fees: FeeData | null;
+  typedSummary: string;
+  calldataScroll: number;
+  busy: boolean;
+  status: string;
+}
+
+function NormalView(props: NormalViewProps) {
+  return (
+    <box flexDirection="column" paddingLeft={1} paddingRight={1} paddingBottom={1} width="100%" height="100%">
       <box flexDirection="row" justifyContent="space-between">
         <box flexDirection="row">
           <text attributes={1}>kura</text>
-          <text fg="#666"> · </text>
-          <text fg="#88c0d0" attributes={1}>{kindLabel()}</text>
+          <text fg={COLORS.dim}> · </text>
+          <text fg={COLORS.accent} attributes={1}>{props.kindLabel}</text>
         </box>
-        <text fg="#666">{`[tab] view: ${view()}`}</text>
+        <text fg={COLORS.dim}>{`[tab] view: ${props.view}`}</text>
       </box>
       <box flexDirection="row" marginTop={1}>
-        <text fg="#666">request </text>
-        <text fg="#888">{props.detail.request.id.slice(0, 8)}</text>
-        <text fg="#666">  ·  chain </text>
-        <text fg="#888">{String(props.detail.request.chainId)}</text>
+        <text fg={COLORS.label}>request </text>
+        <text fg={COLORS.value}>{props.detail.request.id.slice(0, 8)}</text>
+        <text fg={COLORS.label}>  ·  chain </text>
+        <text fg={COLORS.value}>{props.chainLabel}</text>
       </box>
       <box flexDirection="row">
-        <text fg="#666">source </text>
-        <text fg="#88c0d0">{props.detail.request.source}</text>
+        <text fg={COLORS.label}>source  </text>
+        <text fg={COLORS.accent}>{props.source}</text>
       </box>
 
-      <Show when={view() === "outcome"}>
-        <OutcomeView kind={kind()} payload={payload()} sim={sim()} decoded={props.decoded} />
+      <Show when={props.view === "outcome"}>
+        <OutcomeView
+          kind={props.kind}
+          payload={props.payload}
+          sim={props.sim}
+          semantic={props.semantic}
+          typedSummary={props.typedSummary}
+          enriched={props.enriched}
+          fees={props.fees}
+          chainSymbol={props.chainSymbol}
+        />
       </Show>
-      <Show when={view() === "calldata"}>
-        <CalldataView decoded={props.decoded} payload={payload()} />
+      <Show when={props.view === "calldata"}>
+        <CalldataView
+          semantic={props.semantic}
+          payload={props.payload}
+          kind={props.kind}
+          scroll={props.calldataScroll}
+        />
       </Show>
 
-      <box marginTop={1} flexDirection="column">
-        <box flexDirection="row">
-          <text fg="#666">risk </text>
-          <text fg={LEVEL_COLORS[risk().level]} attributes={1}>{`[${LEVEL_LABEL[risk().level]}]`}</text>
+      <Show when={props.view === "outcome"}>
+        <box marginTop={1} flexDirection="column">
+          <box flexDirection="row">
+            <text fg={COLORS.label}>risk    </text>
+            <text fg={LEVEL_COLORS[props.risk.level]} attributes={1}>{`[${LEVEL_LABEL[props.risk.level]}]`}</text>
+            <Show when={!props.enriched}>
+              <text fg={COLORS.dim}>  loading...</text>
+            </Show>
+          </box>
+          <For each={props.risk.findings}>
+            {(f: RiskFinding) => (
+              <box flexDirection="row">
+                <text fg={COLORS.label}>          · </text>
+                <text fg={LEVEL_COLORS[f.level]}>{f.id}</text>
+                <text fg={COLORS.label}>  </text>
+                <text fg={COLORS.value}>{f.message}</text>
+              </box>
+            )}
+          </For>
         </box>
-        <For each={risk().findings}>
-          {(f: RiskFinding) => (
-            <text fg={LEVEL_COLORS[f.level]}>{`  · ${f.id}  ${f.message}`}</text>
-          )}
-        </For>
-      </box>
+      </Show>
 
-      <box marginTop={1} flexDirection="row" justifyContent="space-between">
-        <box flexDirection="row">
-          <text fg="#a3be8c">[a]</text><text fg="#888"> approve (Touch ID)  </text>
-          <text fg="#ff8c66">[r]</text><text fg="#888"> reject  </text>
-          <text fg="#88c0d0">[tab]</text><text fg="#888"> toggle  </text>
-          <text fg="#888">[q] cancel</text>
-        </box>
-        <text fg={busy() ? "#ffc857" : "#666"}>{status()}</text>
+      {/* spacer pushes footer to absolute bottom */}
+      <box flexGrow={1} />
+
+      <FooterHints view={props.view} busy={props.busy} status={props.status} />
+    </box>
+  );
+}
+
+function FooterHints(props: { view: View; busy: boolean; status: string }) {
+  return (
+    <box flexDirection="row" justifyContent="space-between">
+      <box flexDirection="row">
+        <text fg={COLORS.ok}>[a]</text><text fg={COLORS.dim}> approve (Touch ID)  </text>
+        <text fg={COLORS.bad}>[r]</text><text fg={COLORS.dim}> reject  </text>
+        <text fg={COLORS.accent}>[tab]</text><text fg={COLORS.dim}> toggle  </text>
+        <Show when={props.view === "calldata"}>
+          <text fg={COLORS.accent}>[j/k]</text><text fg={COLORS.dim}> scroll  </text>
+          <text fg={COLORS.accent}>[e]</text><text fg={COLORS.dim}> expand  </text>
+          <text fg={COLORS.accent}>[c]</text><text fg={COLORS.dim}> copy</text>
+        </Show>
+        <Show when={props.view === "outcome"}>
+          <text fg={COLORS.dim}>[q] cancel</text>
+        </Show>
       </box>
+      <text fg={props.busy ? COLORS.warn : COLORS.dim}>{props.status}</text>
     </box>
   );
 }
@@ -187,7 +390,11 @@ function OutcomeView(props: {
   kind: string;
   payload: Record<string, unknown>;
   sim: SimulationResult | undefined;
-  decoded: DecodedArgs;
+  semantic: SemanticTx | undefined;
+  typedSummary: string;
+  enriched: boolean;
+  fees: FeeData | null;
+  chainSymbol: string;
 }) {
   const isConnect = props.kind === "connect";
   const isSign = props.kind === "personal_sign" || props.kind === "eth_signTypedData_v4";
@@ -199,13 +406,13 @@ function OutcomeView(props: {
         <ConnectOutcome payload={props.payload} />
       </Show>
       <Show when={isSign}>
-        <SignOutcome kind={props.kind} payload={props.payload} />
+        <SignOutcome kind={props.kind} payload={props.payload} typedSummary={props.typedSummary} />
       </Show>
       <Show when={isBatch}>
         <BatchOutcome payload={props.payload} />
       </Show>
       <Show when={isTx}>
-        <TxOutcome decoded={props.decoded} sim={props.sim} payload={props.payload} />
+        <TxOutcome semantic={props.semantic} sim={props.sim} payload={props.payload} enriched={props.enriched} fees={props.fees} chainSymbol={props.chainSymbol} />
       </Show>
     </box>
   );
@@ -213,20 +420,22 @@ function OutcomeView(props: {
 
 function ConnectOutcome(props: { payload: Record<string, unknown> }) {
   const origin = (props.payload.origin as string) ?? "(unknown origin)";
+  const host = origin.replace(/^https?:\/\//, "").replace(/\/$/, "");
   return (
     <box flexDirection="column">
-      <text>{`dapp wants to connect: ${origin}`}</text>
-      <text fg="#666">approve to share your wallet address with this site</text>
+      <text attributes={1}>{`Connect wallet to ${host}`}</text>
+      <text fg={COLORS.label} marginTop={1}>This shares your wallet address with the site (read-only).</text>
+      <text fg={COLORS.label}>Each transaction or signature will ask for approval separately.</text>
     </box>
   );
 }
 
-function SignOutcome(props: { kind: string; payload: Record<string, unknown> }) {
+function SignOutcome(props: { kind: string; payload: Record<string, unknown>; typedSummary: string }) {
   const params = (props.payload.params as unknown[]) ?? [];
-  let pretty = "";
-  try {
-    if (props.kind === "personal_sign") {
-      const msgHex = params[0] as string | undefined;
+  if (props.kind === "personal_sign") {
+    const msgHex = params[0];
+    let pretty = "";
+    try {
       if (typeof msgHex === "string" && msgHex.startsWith("0x")) {
         try {
           pretty = hexToString(msgHex as `0x${string}`);
@@ -236,17 +445,25 @@ function SignOutcome(props: { kind: string; payload: Record<string, unknown> }) 
       } else {
         pretty = String(msgHex ?? "");
       }
-    } else {
-      const data = params[1];
-      pretty = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    } catch {
+      pretty = JSON.stringify(params);
     }
-  } catch {
-    pretty = JSON.stringify(params);
+    return (
+      <box flexDirection="column">
+        <text>sign request:</text>
+        <text fg={COLORS.accent}>{pretty.slice(0, 600)}</text>
+      </box>
+    );
   }
   return (
     <box flexDirection="column">
-      <text>sign request:</text>
-      <text fg="#88c0d0">{pretty.slice(0, 600)}</text>
+      <Show
+        when={props.typedSummary}
+        fallback={<text fg={COLORS.dim}>decoding typed data...</text>}
+      >
+        <text fg={COLORS.ok} attributes={1}>{props.typedSummary}</text>
+        <text fg={COLORS.dim} marginTop={1}>press [tab] to inspect raw JSON</text>
+      </Show>
     </box>
   );
 }
@@ -263,74 +480,309 @@ function BatchOutcome(props: { payload: Record<string, unknown> }) {
           </text>
         )}
       </For>
-      <text fg="#666">approve all at once. step-by-step approval not yet wired.</text>
+      <text fg={COLORS.dim}>approve all at once. step-by-step approval not yet wired.</text>
     </box>
   );
 }
 
 function TxOutcome(props: {
-  decoded: DecodedArgs;
+  semantic: SemanticTx | undefined;
   sim: SimulationResult | undefined;
   payload: Record<string, unknown>;
+  enriched: boolean;
+  fees: FeeData | null;
+  chainSymbol: string;
 }) {
   return (
     <box flexDirection="column">
-      <Show when={props.decoded.fnName}>
-        <text>{`fn: ${props.decoded.fnName}`}</text>
-        <Show when={props.decoded.args && props.decoded.args.length > 0}>
-          <For each={props.decoded.args!}>
-            {(arg, idx) => <text>{`    arg${idx()}: ${fmtArg(arg)}`}</text>}
-          </For>
+      <Show
+        when={props.semantic}
+        fallback={
+          <Show when={!props.enriched} fallback={<text fg={COLORS.dim}>no decoded summary; see calldata view</text>}>
+            <text fg={COLORS.dim}>decoding transaction...</text>
+          </Show>
+        }
+      >
+        <text attributes={1}>{props.semantic!.description}</text>
+
+        <Show when={props.semantic!.contract}>
+          <box flexDirection="row" marginTop={1}>
+            <text fg={COLORS.label}>contract  </text>
+            <Show
+              when={props.semantic!.contract!.label}
+              fallback={
+                <Show
+                  when={props.semantic!.token?.symbol}
+                  fallback={<text fg={COLORS.value}>{fmtAddr(props.semantic!.contract!.address, 4)}</text>}
+                >
+                  <text fg={COLORS.ok}>{props.semantic!.token!.symbol}</text>
+                  <text fg={COLORS.label}> ({fmtAddr(props.semantic!.contract!.address, 4)})</text>
+                </Show>
+              }
+            >
+              <text fg={COLORS.ok}>{props.semantic!.contract!.label}</text>
+              <text fg={COLORS.label}> ({fmtAddr(props.semantic!.contract!.address, 4)})</text>
+            </Show>
+          </box>
+        </Show>
+        <Show when={props.semantic!.fnSignature}>
+          <box flexDirection="row">
+            <text fg={COLORS.label}>fn        </text>
+            <text fg={COLORS.value}>{props.semantic!.fnSignature}</text>
+          </box>
+        </Show>
+        <Show when={props.semantic!.token && (props.semantic!.kind === "approve" || props.semantic!.kind === "transfer" || props.semantic!.kind === "transferFrom" || props.semantic!.kind === "permit")}>
+          <box flexDirection="row">
+            <text fg={COLORS.label}>amount    </text>
+            <text fg={COLORS.value} attributes={1}>
+              {props.semantic!.unlimited ? "unlimited" : props.semantic!.token!.amount}
+            </text>
+            <text fg={COLORS.label}> {props.semantic!.token!.symbol}</text>
+          </box>
+        </Show>
+        <Show when={props.semantic!.spender}>
+          <box flexDirection="row">
+            <text fg={COLORS.label}>spender   </text>
+            <text fg={COLORS.accent}>{props.semantic!.spender!.label ?? fmtAddr(props.semantic!.spender!.address, 4)}</text>
+            <Show when={props.semantic!.spender!.label}>
+              <text fg={COLORS.label}> ({fmtAddr(props.semantic!.spender!.address, 4)})</text>
+            </Show>
+          </box>
+        </Show>
+        <Show when={props.semantic!.recipient && props.semantic!.kind !== "transferFrom"}>
+          <box flexDirection="row">
+            <text fg={COLORS.label}>to        </text>
+            <text fg={COLORS.accent}>{props.semantic!.recipient!.label ?? fmtAddr(props.semantic!.recipient!.address, 4)}</text>
+          </box>
         </Show>
       </Show>
-      <Show when={!props.decoded.fnName && props.decoded.signature}>
-        <text>{`fn: ${props.decoded.signature}`}</text>
-      </Show>
-      <Show when={!props.decoded.fnName && !props.decoded.signature}>
-        <text fg="#666">{`unknown selector ${props.decoded.selector}`}</text>
-      </Show>
-      <Show
-        when={props.sim?.diffs && props.sim!.diffs.length > 0}
-        fallback={<text fg="#666">no balance diffs predicted</text>}
-      >
-        <text fg="#888">predicted balance changes:</text>
-        <For each={props.sim!.diffs}>
-          {(d) => (
-            <text>{`  ${d.delta.startsWith("-") ? "-" : "+"} ${d.symbol} ${d.delta} ${d.usd ? `($${d.usd.toFixed(2)})` : ""}`}</text>
-          )}
-        </For>
-      </Show>
-      <Show when={props.sim && !props.sim!.ok}>
-        <text fg="#ff5252">{`simulation failed: ${props.sim!.reason}`}</text>
-      </Show>
+
+      <BalanceBox sim={props.sim} semantic={props.semantic} payload={props.payload} enriched={props.enriched} />
+
       <Show when={props.sim?.gasUsed}>
-        <text fg="#666">{`gas used: ${props.sim!.gasUsed}`}</text>
-      </Show>
-      <Show when={typeof props.payload.value === "string" && props.payload.value !== "0"}>
-        <text fg="#666">{`value: ${props.payload.value as string} wei`}</text>
+        <GasLine gasUsed={props.sim!.gasUsed!} fees={props.fees} chainSymbol={props.chainSymbol} />
       </Show>
     </box>
   );
 }
 
-function CalldataView(props: { decoded: DecodedArgs; payload: Record<string, unknown> }) {
-  const data = (props.payload.data as string) ?? "0x";
-  const chunks = (() => {
-    const out: string[] = [];
-    for (let i = 0; i < data.length; i += 80) out.push(data.slice(i, i + 80));
-    return out;
-  })();
+function GasLine(props: { gasUsed: string; fees: FeeData | null; chainSymbol: string }) {
+  // Compose: gas units · gas price (gwei) · estimated cost (ETH)
+  const formatted = () => {
+    const gasUsed = BigInt(props.gasUsed);
+    const gasUsedFmt = gasUsed.toLocaleString("en-US");
+    const f = props.fees;
+    if (!f) return { line: gasUsedFmt };
+    const priceWei = BigInt(f.maxFeePerGas ?? f.gasPrice ?? "0");
+    if (priceWei === 0n) return { line: gasUsedFmt };
+    // gwei = wei / 1e9, format with 2 decimals
+    const gweiNum = Number(priceWei) / 1e9;
+    const gweiFmt = gweiNum >= 1 ? gweiNum.toFixed(2) : gweiNum.toFixed(4);
+    // cost in wei = gasUsed * priceWei
+    const costWei = gasUsed * priceWei;
+    // ETH = wei / 1e18
+    const ethStr = (() => {
+      const div = 10n ** 18n;
+      const whole = costWei / div;
+      const frac = costWei % div;
+      const fracStr = frac.toString().padStart(18, "0").replace(/0+$/, "");
+      return fracStr.length > 0 ? `${whole}.${fracStr}` : whole.toString();
+    })();
+    return { line: gasUsedFmt, gwei: gweiFmt, eth: ethStr };
+  };
+  const f = formatted();
+  return (
+    <box flexDirection="row" marginTop={1}>
+      <text fg={COLORS.label}>gas       </text>
+      <text fg={COLORS.value}>{f.line}</text>
+      <Show when={f.gwei}>
+        <text fg={COLORS.label}>  ·  </text>
+        <text fg={COLORS.value}>{f.gwei}</text>
+        <text fg={COLORS.label}> gwei</text>
+        <Show when={f.eth}>
+          <text fg={COLORS.label}>  ·  ~</text>
+          <text fg={COLORS.value}>{f.eth}</text>
+          <text fg={COLORS.label}> {props.chainSymbol}</text>
+        </Show>
+      </Show>
+    </box>
+  );
+}
+
+function BalanceBox(props: {
+  sim: SimulationResult | undefined;
+  semantic: SemanticTx | undefined;
+  payload: Record<string, unknown>;
+  enriched: boolean;
+}) {
+  const diffs = () => props.sim?.diffs ?? [];
+  const outDiffs = () => diffs().filter((d) => d.delta.startsWith("-"));
+  const inDiffs = () => diffs().filter((d) => !d.delta.startsWith("-") && d.delta !== "0");
+  const hasDiffs = () => outDiffs().length > 0 || inDiffs().length > 0;
   return (
     <box marginTop={1} flexDirection="column">
-      <text fg="#666">{`selector: ${props.decoded.selector}`}</text>
-      <Show when={props.decoded.signature}>
-        <text fg="#88c0d0">{`fn: ${props.decoded.signature}`}</text>
+      <text fg={COLORS.label}>predicted balance</text>
+      <Show
+        when={hasDiffs()}
+        fallback={
+          <Show
+            when={props.sim}
+            fallback={<text fg={COLORS.dim}>  simulating...</text>}
+          >
+            <Show when={props.sim!.ok} fallback={<text fg={COLORS.bad}>  simulation failed: {props.sim!.reason}</text>}>
+              <text fg={COLORS.dim}>  no balance change (allowance only)</text>
+            </Show>
+          </Show>
+        }
+      >
+        <For each={outDiffs()}>
+          {(d) => (
+            <box flexDirection="row">
+              <text fg={COLORS.bad}>  OUT  </text>
+              <text fg={COLORS.bad}>{fmtAmt(d.delta, d.decimals)} {d.symbol}</text>
+              <Show when={d.usd}>
+                <text fg={COLORS.label}>  ($-{Math.abs(d.usd!).toFixed(2)})</text>
+              </Show>
+            </box>
+          )}
+        </For>
+        <For each={inDiffs()}>
+          {(d) => (
+            <box flexDirection="row">
+              <text fg={COLORS.ok}>  IN   </text>
+              <text fg={COLORS.ok}>+{fmtAmt(d.delta, d.decimals)} {d.symbol}</text>
+              <Show when={d.usd}>
+                <text fg={COLORS.label}>  (${d.usd!.toFixed(2)})</text>
+              </Show>
+            </box>
+          )}
+        </For>
       </Show>
-      <text fg="#666">raw calldata:</text>
-      <For each={chunks.slice(0, 12)}>{(c) => <text>{c}</text>}</For>
-      <Show when={chunks.length > 12}>
-        <text fg="#666">{`...${chunks.length - 12} more lines`}</text>
+    </box>
+  );
+}
+
+function CalldataView(props: { semantic: SemanticTx | undefined; payload: Record<string, unknown>; kind: string; scroll: number }) {
+  if (props.kind === "eth_signTypedData_v4") {
+    const params = (props.payload.params as unknown[]) ?? [];
+    const data = params[1];
+    let pretty = "";
+    try {
+      const parsed = typeof data === "string" ? JSON.parse(data) : data;
+      pretty = JSON.stringify(parsed, null, 2);
+    } catch {
+      pretty = String(data ?? "");
+    }
+    const allLines = pretty.split("\n");
+    const VIEWPORT = 10;
+    const offset = Math.max(0, Math.min(props.scroll, Math.max(0, allLines.length - VIEWPORT)));
+    const visible = allLines.slice(offset, offset + VIEWPORT);
+    return (
+      <box marginTop={1} flexDirection="column">
+        <text fg={COLORS.label}>{`typed data (EIP-712)  ·  ${offset + 1}-${offset + visible.length} / ${allLines.length}`}</text>
+        <For each={visible}>{(c) => <text fg={COLORS.accent}>{c.slice(0, 100)}</text>}</For>
+      </box>
+    );
+  }
+  const data = (props.payload.data as string) ?? "0x";
+  const CHUNK_WIDTH = 80;
+  const allChunks = (() => {
+    const out: string[] = [];
+    for (let i = 0; i < data.length; i += CHUNK_WIDTH) out.push(data.slice(i, i + CHUNK_WIDTH));
+    return out;
+  })();
+  const VIEWPORT = 8;
+  const offset = Math.max(0, Math.min(props.scroll, Math.max(0, allChunks.length - VIEWPORT)));
+  const visible = allChunks.slice(offset, offset + VIEWPORT);
+  const selector = props.semantic?.selector ?? data.slice(0, 10);
+  return (
+    <box marginTop={1} flexDirection="column">
+      <box flexDirection="row">
+        <text fg={COLORS.label}>selector  </text>
+        <text fg={COLORS.value}>{selector}</text>
+      </box>
+      <Show when={props.semantic?.fnSignature}>
+        <box flexDirection="row">
+          <text fg={COLORS.label}>fn        </text>
+          <text fg={COLORS.accent}>{props.semantic!.fnSignature}</text>
+        </box>
       </Show>
+      <Show when={props.semantic?.contract?.address}>
+        <box flexDirection="row">
+          <text fg={COLORS.label}>to        </text>
+          <text fg={COLORS.value}>{props.semantic!.contract!.address}</text>
+          <Show when={props.semantic!.contract!.label}>
+            <text fg={COLORS.label}> ({props.semantic!.contract!.label})</text>
+          </Show>
+        </box>
+      </Show>
+      <text fg={COLORS.label} marginTop={1}>{`raw  ·  ${data.length} chars  ·  lines ${offset + 1}-${offset + visible.length} / ${allChunks.length}  ·  [e] expand`}</text>
+      <For each={visible}>{(c) => <text>{c}</text>}</For>
+    </box>
+  );
+}
+
+function ExpandedCalldata(props: {
+  kindLabel: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  semantic: SemanticTx | undefined;
+  scroll: number;
+  busy: boolean;
+  status: string;
+}) {
+  // Same flush-top padding as NormalView for visual consistency.
+  const isTypedData = props.kind === "eth_signTypedData_v4";
+  const fullText = (() => {
+    if (isTypedData) {
+      const params = (props.payload.params as unknown[]) ?? [];
+      const data = params[1];
+      try {
+        const parsed = typeof data === "string" ? JSON.parse(data) : data;
+        return JSON.stringify(parsed, null, 2);
+      } catch {
+        return String(data ?? "");
+      }
+    }
+    return (props.payload.data as string) ?? "0x";
+  })();
+  const lines = (() => {
+    if (isTypedData) return fullText.split("\n").map((l) => l.slice(0, 200));
+    const out: string[] = [];
+    for (let i = 0; i < fullText.length; i += 100) out.push(fullText.slice(i, i + 100));
+    return out;
+  })();
+  // Reserve 2 rows: 1 for top header, 1 for footer. Body fills the rest.
+  // Conservative VIEWPORT — opentui doesn't expose pane height to children.
+  // Use a generous default (28); user can scroll.
+  const VIEWPORT = 28;
+  const offset = Math.max(0, Math.min(props.scroll, Math.max(0, lines.length - VIEWPORT)));
+  const visible = lines.slice(offset, offset + VIEWPORT);
+  const tag = isTypedData ? "typed-data" : "calldata";
+  return (
+    <box flexDirection="column" paddingLeft={1} paddingRight={1} paddingBottom={1} width="100%" height="100%">
+      <box flexDirection="row" justifyContent="space-between">
+        <box flexDirection="row">
+          <text attributes={1}>kura</text>
+          <text fg={COLORS.dim}> · </text>
+          <text fg={COLORS.accent} attributes={1}>{props.kindLabel}</text>
+          <text fg={COLORS.dim}> · </text>
+          <text fg={COLORS.label}>{tag}</text>
+        </box>
+        <text fg={COLORS.label}>{`lines ${offset + 1}-${offset + visible.length} / ${lines.length}  ·  [j/k] scroll`}</text>
+      </box>
+      <For each={visible}>{(c) => <text fg={isTypedData ? COLORS.accent : COLORS.value}>{c}</text>}</For>
+      <box flexGrow={1} />
+      <box flexDirection="row" justifyContent="space-between">
+        <box flexDirection="row">
+          <text fg={COLORS.ok}>[a]</text><text fg={COLORS.dim}> approve  </text>
+          <text fg={COLORS.bad}>[r]</text><text fg={COLORS.dim}> reject  </text>
+          <text fg={COLORS.accent}>[tab]</text><text fg={COLORS.dim}> back  </text>
+          <text fg={COLORS.accent}>[e]</text><text fg={COLORS.dim}> collapse  </text>
+          <text fg={COLORS.accent}>[c]</text><text fg={COLORS.dim}> copy</text>
+        </box>
+        <text fg={props.busy ? COLORS.warn : COLORS.dim}>{props.status}</text>
+      </box>
     </box>
   );
 }
@@ -346,22 +798,35 @@ export async function run(args: string[]): Promise<void> {
   const base = `https://${cfg.daemonHost}:${cfg.daemonPort}`;
   const fetchOpts: RequestInit & { tls?: { rejectUnauthorized: boolean } } = { headers: { "X-Kura-Key": secret }, tls: { rejectUnauthorized: false } };
 
-  const resp = await fetch(`${base}/requests/${id}`, fetchOpts);
-  if (!resp.ok) {
+  const fetchDetail = async (): Promise<PendingDetail | null> => {
+    try {
+      const resp = await fetch(`${base}/requests/${id}`, fetchOpts);
+      if (!resp.ok) return null;
+      return (await resp.json()) as PendingDetail;
+    } catch {
+      return null;
+    }
+  };
+
+  const fetchFees = async (chainId: number): Promise<FeeData | null> => {
+    try {
+      const resp = await fetch(`${base}/gas?chain=${chainId}`, fetchOpts);
+      if (!resp.ok) return null;
+      return (await resp.json()) as FeeData;
+    } catch {
+      return null;
+    }
+  };
+
+  const initial = await fetchDetail();
+  if (!initial) {
     console.error(`request ${id} not found`);
     process.exit(1);
   }
-  const detail = (await resp.json()) as PendingDetail;
-  const data = (detail.request.payload as { data?: `0x${string}` })?.data ?? "0x";
-  const to = (detail.request.payload as { to?: `0x${string}` })?.to ?? null;
-  const parity = await decodeCalldata(to, data as `0x${string}`).catch(() => ({ selector: "0x", signature: undefined as string | undefined }));
-  const decoded = decodeArgs(data as `0x${string}`, parity.signature);
-  decoded.selector = parity.selector || decoded.selector;
 
   // Pre-disable async notification modes BEFORE opentui starts touching
   // the terminal, then install signal handlers that route through quit()
-  // so SIGINT/SIGTERM never bypass renderer.destroy(). See terminal.ts for
-  // the full ordering rationale (matches the TUI run() in src/tui/index.tsx).
+  // so SIGINT/SIGTERM never bypass renderer.destroy().
   disableTerminalNotifications();
   attachRestoreHandlers();
 
@@ -378,11 +843,8 @@ export async function run(args: string[]): Promise<void> {
     setTimeout(() => quit(0), 200);
   };
 
-  // exitSignals: [] / exitOnCtrlC: false: kura owns shutdown. The Popup
-  // component's useKeyboard catches Ctrl+C and routes it through quit(),
-  // and attachRestoreHandlers wires SIGINT/SIGTERM/SIGHUP to quit() too.
   render(
-    () => <Popup detail={detail} decoded={decoded} onDecide={onDecide} />,
+    () => <Popup initial={initial} fetchLatest={fetchDetail} fetchFees={fetchFees} onDecide={onDecide} />,
     { exitSignals: [], exitOnCtrlC: false },
   );
 }

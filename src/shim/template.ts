@@ -90,6 +90,64 @@ export const USERSCRIPT_TEMPLATE = `// ==UserScript==
       emit("chainChanged", target);
       return null;
     }
+    if (method === "wallet_addEthereumChain") {
+      // We don't maintain a known-chain list dapp-side. The daemon's chain
+      // list is authoritative; if the chain isn't supported the next eth_call
+      // will surface that. Accept silently for now (matches MetaMask UX once
+      // the chain is already added).
+      var addedChain = params && params[0] && params[0].chainId;
+      if (addedChain) {
+        currentChainId = addedChain;
+        emit("chainChanged", addedChain);
+      }
+      return null;
+    }
+    if (method === "wallet_getCapabilities") {
+      // EIP-5792: empty caps => "legacy wallet, no atomic batch / paymaster /
+      // session keys". Without this, dapps that probe capabilities (Uniswap,
+      // newer Aave) may bail before falling back to legacy eth_sendTransaction.
+      var capAccount = (params && params[0]) || (currentAccounts[0] || "0x");
+      var caps = {};
+      caps[capAccount] = {};
+      return caps;
+    }
+    if (method === "wallet_sendCalls") {
+      // EIP-5792 atomic batch. We don't implement; dapps must fall back to
+      // legacy eth_sendTransaction after seeing -32601.
+      throw { code: -32601, message: "kura: wallet_sendCalls not implemented, use eth_sendTransaction" };
+    }
+    if (method === "wallet_getCallsStatus" || method === "wallet_showCallsStatus") {
+      throw { code: -32601, message: "kura: " + method + " not implemented" };
+    }
+    if (method === "wallet_revokePermissions") {
+      // We treat permissions as session-scoped already (DappSession in core/types.ts).
+      // Accept silently — kura users revoke via the TUI connections view.
+      return null;
+    }
+    if (method === "wallet_watchAsset") {
+      // We don't track tokens client-side; portfolio is derived from on-chain.
+      return false;
+    }
+    if (method === "wallet_requestPermissions") {
+      // Dapps use this to ask for eth_accounts permission. Treat as connect.
+      var permResult = await req("/requests", {
+        kind: "connect",
+        chainId: parseInt(currentChainId, 16) || 1,
+        source: "shim:" + ORIGIN,
+        origin: ORIGIN,
+        payload: { params: params, method: method },
+      });
+      if (permResult.decision === "approve" && Array.isArray(permResult.accounts)) {
+        currentAccounts = permResult.accounts;
+        emit("accountsChanged", currentAccounts);
+        return [{ parentCapability: "eth_accounts", caveats: [{ type: "restrictReturnedAccounts", value: currentAccounts }] }];
+      }
+      throw { code: 4001, message: "user rejected" };
+    }
+    if (method === "wallet_getPermissions") {
+      if (currentAccounts.length === 0) return [];
+      return [{ parentCapability: "eth_accounts", caveats: [{ type: "restrictReturnedAccounts", value: currentAccounts }] }];
+    }
     if (method === "personal_sign" || method === "eth_signTypedData_v4" || method === "eth_sign") {
       var sigResult = await req("/requests", {
         kind: method === "personal_sign" ? "personal_sign" : "eth_signTypedData_v4",
@@ -113,14 +171,20 @@ export const USERSCRIPT_TEMPLATE = `// ==UserScript==
       if (txResult.decision === "approve" && txResult.txHash) return txResult.txHash;
       throw { code: 4001, message: txResult.error || "user rejected" };
     }
-    if (method && method.indexOf("eth_") === 0) {
-      var r = await fetch(BASE + "/rpc?chain=" + (parseInt(currentChainId, 16) || 1), {
-        method: "POST",
-        headers: { "X-Kura-Key": SECRET, "Content-Type": "application/json" },
-        body: JSON.stringify({ method: method, params: params }),
-      }).then(function (r) { return r.json(); }).catch(function () { return { error: "kura rpc failed" }; });
+    if (method && (method.indexOf("eth_") === 0 || method.indexOf("net_") === 0 || method === "web3_clientVersion")) {
+      var r;
+      try {
+        r = await req("/rpc?chain=" + (parseInt(currentChainId, 16) || 1), { method: method, params: params });
+      } catch (e) {
+        throw { code: -32603, message: "kura: rpc transport failed: " + (e && e.message || e) };
+      }
       if (r && r.result !== undefined) return r.result;
-      throw { code: -32603, message: (r && r.error) || "kura rpc failed" };
+      if (r && r.error) {
+        var errCode = (r.error && r.error.code) || -32603;
+        var errMsg = (r.error && r.error.message) || "kura rpc error";
+        throw { code: errCode, message: errMsg };
+      }
+      throw { code: -32603, message: "kura rpc returned no result" };
     }
     throw { code: -32601, message: "method not supported by kura: " + method };
   }

@@ -128,7 +128,15 @@ export interface ActivityItem {
   decimals?: number;
   direction: "in" | "out" | "self";
   kind: "native" | "erc20" | "contract";
+  // Human-readable summary of what the tx does, populated by history.ts via
+  // describeTx for contract calls and getTokenMeta for ERC20 transfers.
+  // Falls back to `${arrow} ${amount} ${symbol}` rendering when absent.
+  description?: string;
+  // True when the row is filtered out by spam/dust heuristics. Kept on the
+  // item so callers can opt-in to showing them (e.g., `kura history --all`).
+  isDust?: boolean;
 }
+
 
 export interface DecodedCall {
   selector: Hex;
@@ -153,6 +161,10 @@ export interface PortfolioToken {
   balance: string;
   usd?: number;
   pct?: number;
+  // Tokens flagged as spam by Alchemy or with no USD price + small balance
+  // get marked here so the TUI can de-prioritize / hide them.
+  unverified?: boolean;
+  spam?: boolean;
 }
 
 export interface Portfolio {

@@ -2,6 +2,7 @@ import { spawn } from "bun";
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { PendingRequest, RiskResult, SimulationResult } from "../core/types.ts";
+import type { SemanticTx } from "../core/decode-tx.ts";
 import { emit } from "./events.ts";
 import { logAudit } from "../core/audit-log.ts";
 import { resolveSelfBinary, isCompiledBinary } from "../core/self-binary.ts";
@@ -23,6 +24,8 @@ export interface PendingEntry {
   request: PendingRequest;
   simulation?: SimulationResult;
   risk?: RiskResult;
+  semantic?: SemanticTx;
+  enriched: boolean;
   resolver: (result: { decision: Decision; txHash?: string; error?: string }) => void;
   resolved: boolean;
 }
@@ -31,13 +34,15 @@ const queue = new Map<string, PendingEntry>();
 
 export function enqueue(
   request: PendingRequest,
-  meta: { simulation?: SimulationResult; risk?: RiskResult } = {},
+  meta: { simulation?: SimulationResult; risk?: RiskResult; semantic?: SemanticTx } = {},
 ): Promise<{ decision: Decision; txHash?: string; error?: string }> {
   return new Promise((resolve) => {
     const entry: PendingEntry = {
       request,
       simulation: meta.simulation,
       risk: meta.risk,
+      semantic: meta.semantic,
+      enriched: meta.simulation !== undefined || meta.risk !== undefined || meta.semantic !== undefined,
       resolved: false,
       resolver: (result) => {
         if (entry.resolved) return;
@@ -60,6 +65,19 @@ export function enqueue(
       entry.resolver({ decision: "reject", error: `popup spawn failed: ${err.message}` });
     });
   });
+}
+
+export function enrich(
+  id: string,
+  meta: { simulation?: SimulationResult; risk?: RiskResult; semantic?: SemanticTx },
+): void {
+  const entry = queue.get(id);
+  if (!entry) return;
+  if (meta.simulation !== undefined) entry.simulation = meta.simulation;
+  if (meta.risk !== undefined) entry.risk = meta.risk;
+  if (meta.semantic !== undefined) entry.semantic = meta.semantic;
+  entry.enriched = true;
+  emit("request:enriched", { id });
 }
 
 export function get(id: string): PendingEntry | undefined {
@@ -137,7 +155,7 @@ async function spawnPopup(id: string): Promise<void> {
   // -B = no tmux popup border (the inner opentui box already draws one).
   // -w/-h = popup size as % of pane.
   const proc = spawn({
-    cmd: [TMUX_BIN, "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "50%", ...extraArgs, popupCmd],
+    cmd: [TMUX_BIN, "display-popup", "-E", "-B", "-d", process.cwd(), "-w", "70%", "-h", "60%", ...extraArgs, popupCmd],
     stdout: "pipe",
     stderr: "pipe",
   });

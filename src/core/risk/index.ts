@@ -5,6 +5,7 @@ import { tokenSecurity, addressSecurity } from "../goplus.ts";
 import { checkOrigin } from "../phishing.ts";
 import { lookupDapp } from "../dapps.ts";
 import { getClient } from "../rpc.ts";
+import { withTimeout } from "../promise.ts";
 
 const MAX_UINT = 2n ** 256n - 1n;
 
@@ -87,7 +88,7 @@ async function enrich(input: AssessInput): Promise<RiskContext["external"]> {
   if (input.kind === "approve" && input.to) {
     try {
       const client = await getClient(input.chainId);
-      const code = await client.getCode({ address: input.to });
+      const code = await withTimeout(client.getCode({ address: input.to }), 1500, "getCode timeout");
       out.contractIsEoa = !code || code === "0x";
     } catch {
       // best effort

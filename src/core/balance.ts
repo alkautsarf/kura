@@ -41,6 +41,24 @@ async function alchemyRpc<T>(chainId: number, method: string, params: unknown[])
   return json.result as T;
 }
 
+// Cached per-chain spam contract set. Alchemy maintains a curated list of
+// known spam tokens (airdrop scams, fake-USDC, etc.). We fetch once per
+// process and use it to filter portfolio + activity rows.
+const spamCache = new Map<number, Set<string>>();
+export async function getSpamContracts(chainId: number): Promise<Set<string>> {
+  const cached = spamCache.get(chainId);
+  if (cached) return cached;
+  try {
+    const result = await alchemyRpc<string[]>(chainId, "alchemy_getSpamContracts", []);
+    const set = new Set(result.map((a) => a.toLowerCase()));
+    spamCache.set(chainId, set);
+    return set;
+  } catch {
+    spamCache.set(chainId, new Set());
+    return new Set();
+  }
+}
+
 export async function nativeBalance(chainId: number, address: Address): Promise<bigint> {
   const client = await getClient(chainId);
   return client.getBalance({ address });
