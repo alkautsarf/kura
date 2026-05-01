@@ -42,11 +42,13 @@ kura history --chain 11155111 --limit 50
 kura connections      # list active dapp sessions
 kura audit -n 20      # off-chain event log
 kura watch            # live SSE stream of daemon events
-kura wallet list      # manage wallets (also: add | use | remove | show)
+kura wallet list      # manage wallets (also: add | use | remove | show | migrate)
 kura install-shim     # (re)install the qutebrowser userscript
 ```
 
 `kura wallet add <name>` accepts `--generate`, `--import-key <hex|->`, `--watch-only <0x...>`, `--default`. Without flags it prompts interactively. `kura wallet use <name>` (alias `switch`) sets the default. `kura wallet remove <name> [--purge-key] [-y]` drops the wallet (and optionally its Keychain entry); the next remaining wallet becomes default.
+
+`kura wallet migrate` rotates pre-v0.1.9 wallet entries (created with the old `security` CLI ACL) onto the new LAContext-gated path so future signs pop Touch ID instead of Mac password. Run once after `brew upgrade kura` if you have wallets predating v0.1.9.
 
 ## TUI keys (home view)
 
@@ -64,7 +66,7 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 **Qutebrowser shim** (`~/.qutebrowser/greasemonkey/kura.user.js`): announces kura via EIP-6963, masquerades as MetaMask, routes JSON-RPC through `GM.xmlHttpRequest` to the daemon. Per-install secret in `X-Kura-Key`.
 
-**Keys**: stored in macOS Keychain at `xyz.<wallet>.kura`. When `kura-signer` (Swift binary in `swift/`) is built and Touch ID is unlocked, every read is biometry-gated. Without it, the wallet falls back to plain `security` CLI (Mac password).
+**Keys**: stored in macOS Keychain at `xyz.<wallet>.kura`. The Swift `kura-signer` binary (in `swift/`) gates every read through `LAContext.evaluatePolicy(.deviceOwnerAuthentication)`, so each signature pops a Touch ID prompt with a meaningful reason ("kura: send 0.5 ETH on Ethereum (main)"). Mac password is the automatic fallback when biometry is hardware-disabled. Without `kura-signer` (e.g. fresh clone, Swift binary not built), the runtime falls back to plain `security` CLI with Mac password on every read.
 
 ## Chains
 

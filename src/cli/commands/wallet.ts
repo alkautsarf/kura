@@ -4,7 +4,9 @@ import { ask, askSecret, choose, confirm, readStdin } from "../prompt.ts";
 import {
   getConfig,
   getWallet,
+  isBiometryMigrated,
   listWallets,
+  markBiometryMigrated,
   setDefaultWallet,
 } from "../../core/config.ts";
 import {
@@ -16,7 +18,15 @@ import {
   removeWalletWithFallback,
   walletPresence,
 } from "../../core/wallet.ts";
-import { walletService, signerAvailable } from "../../core/keychain.ts";
+import {
+  WALLET_ACCOUNT,
+  deletePassword,
+  gateBiometryOrThrow,
+  readPassword,
+  signerAvailable,
+  walletService,
+  writeWalletKey,
+} from "../../core/keychain.ts";
 import type { Address, WalletProfile } from "../../core/types.ts";
 
 interface WalletArgs {
@@ -45,8 +55,59 @@ export async function run(args: WalletArgs): Promise<void> {
       return removeCmd(args);
     case "show":
       return showCmd(args);
+    case "migrate":
+      return migrateCmd();
     default:
-      throw new Error(`unknown wallet subcommand: ${sub}\nusage: kura wallet [list|add|use|remove|show]`);
+      throw new Error(`unknown wallet subcommand: ${sub}\nusage: kura wallet [list|add|use|remove|show|migrate]`);
+  }
+}
+
+async function migrateCmd(): Promise<void> {
+  if (!signerAvailable()) {
+    console.log(`${COLOR.yellow}WARN${COLOR.reset} kura-signer not built; nothing to migrate.`);
+    console.log(`${COLOR.dim}build with: cd swift && swift build -c release${COLOR.reset}`);
+    return;
+  }
+  if (await isBiometryMigrated()) {
+    console.log("already migrated. all wallets use Touch ID via kura-signer.");
+    return;
+  }
+  const wallets = (await listWallets()).filter((w) => !w.watchOnly && w.source !== "keychain-shared");
+  if (wallets.length === 0) {
+    console.log("no hot wallets to migrate.");
+    await markBiometryMigrated();
+    return;
+  }
+  console.log(`migrating ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} to Touch ID...`);
+  console.log(`${COLOR.dim}each wallet pops one Mac password prompt (read old entry); after that all reads use Touch ID.${COLOR.reset}\n`);
+  let migrated = 0;
+  let failed = 0;
+  for (const w of wallets) {
+    process.stdout.write(`  ${w.name.padEnd(24)} `);
+    try {
+      const key = await readPassword(walletService(w.name), WALLET_ACCOUNT);
+      if (!key) {
+        console.log(`${COLOR.yellow}skip${COLOR.reset} (no key in keychain)`);
+        continue;
+      }
+      // Use raw deletePassword (not deleteWalletKey) so the OLD entry's password-ACL
+      // is the only thing we satisfy. deleteWalletKey would route through kura-signer
+      // which calls LAContext.evaluatePolicy — but the new biometry-gated entry doesn't
+      // exist yet, so that call would fail or pop a prompt for a non-existent entry.
+      await deletePassword(walletService(w.name), WALLET_ACCOUNT);
+      await writeWalletKey(w.name, key);
+      console.log(`${COLOR.green}ok${COLOR.reset}`);
+      migrated++;
+    } catch (err) {
+      console.log(`${COLOR.red}error${COLOR.reset}: ${(err as Error).message}`);
+      failed++;
+    }
+  }
+  if (failed === 0) {
+    await markBiometryMigrated();
+    console.log(`\n${COLOR.green}OK${COLOR.reset} migrated ${migrated}/${wallets.length}. future signs will Touch ID.`);
+  } else {
+    console.log(`\n${COLOR.yellow}WARN${COLOR.reset} migrated ${migrated}/${wallets.length} (${failed} failed). Re-run after fixing errors.`);
   }
 }
 
@@ -83,6 +144,7 @@ async function addCmd(args: WalletArgs): Promise<void> {
 
   let result;
   if (args.generate) {
+    await gateBiometryOrThrow(`kura: reveal new private key for ${name}`);
     result = await createGeneratedWallet(name);
     console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} new wallet generated. address: ${result.profile.address}`);
     console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} private key WILL be stored in macOS Keychain only.`);
@@ -112,6 +174,7 @@ async function addCmd(args: WalletArgs): Promise<void> {
       { label: "use existing keychain item", value: "keychain" },
     ]);
     if (choice === "generate") {
+      await gateBiometryOrThrow(`kura: reveal new private key for ${name}`);
       result = await createGeneratedWallet(name);
       console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} new wallet generated. address: ${result.profile.address}`);
       console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} private key WILL be stored in macOS Keychain only.`);

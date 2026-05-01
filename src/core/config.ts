@@ -99,6 +99,11 @@ interface StateFile {
   wallets: Record<string, WalletProfile>;
   sessions: Record<string, { walletName: string; address: string; chainId: number; connectedAt: number }>;
   lastUpdated: string;
+  // Set true once `kura wallet migrate` has rotated all hot wallets onto the new
+  // LAContext-gated keychain entries. Pre-migration entries were stored via plain
+  // `security` CLI with -T "" ACL (Mac password on read); post-migration entries
+  // are stored by kura-signer (Touch ID via LAContext, Mac password fallback).
+  biometryMigrated?: boolean;
 }
 
 const EMPTY_STATE: StateFile = {
@@ -116,6 +121,7 @@ export async function readState(path: string = PATH_STATE): Promise<StateFile> {
       wallets: parsed.wallets ?? {},
       sessions: parsed.sessions ?? {},
       lastUpdated: parsed.lastUpdated ?? new Date(0).toISOString(),
+      biometryMigrated: parsed.biometryMigrated ?? false,
     };
   } catch {
     return { ...EMPTY_STATE };
@@ -131,6 +137,18 @@ export async function writeState(state: StateFile, path: string = PATH_STATE): P
 export async function listWallets(): Promise<WalletProfile[]> {
   const state = await readState();
   return Object.values(state.wallets);
+}
+
+export async function isBiometryMigrated(): Promise<boolean> {
+  const state = await readState();
+  return state.biometryMigrated === true;
+}
+
+export async function markBiometryMigrated(): Promise<void> {
+  const state = await readState();
+  if (state.biometryMigrated === true) return;
+  state.biometryMigrated = true;
+  await writeState(state);
 }
 
 export async function getWallet(name: string): Promise<WalletProfile | null> {

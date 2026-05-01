@@ -1,8 +1,18 @@
-import { createWalletClient, http, hexToString, type Hex, type Address } from "viem";
+import { createWalletClient, formatUnits, http, hexToString, type Hex, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getKnownChain, resolveRpcUrl } from "./chains.ts";
 import { readWalletKey, readAlchemyKey } from "./keychain.ts";
 import { logAudit } from "./audit-log.ts";
+
+function fmtValueFor(reason: string, valueWei: string | undefined, symbol: string): string {
+  if (!valueWei || valueWei === "0") return reason;
+  try {
+    const eth = formatUnits(BigInt(valueWei), 18);
+    return `${reason} ${eth} ${symbol}`;
+  } catch {
+    return reason;
+  }
+}
 
 export interface SignSendInput {
   walletName: string;
@@ -19,7 +29,8 @@ export interface SignSendInput {
 export async function signAndSend(input: SignSendInput): Promise<{ txHash: Hex }> {
   const chain = getKnownChain(input.chainId);
   if (!chain) throw new Error(`unknown chain ${input.chainId}`);
-  const key = await readWalletKey(input.walletName);
+  const reason = fmtValueFor(`kura: send`, input.value, chain.symbol) + ` on ${chain.name} (${input.walletName})`;
+  const key = await readWalletKey(input.walletName, reason);
   if (!key) throw new Error(`wallet ${input.walletName} not in keychain`);
   const normalized = (key.startsWith("0x") ? key : "0x" + key) as Hex;
   const account = privateKeyToAccount(normalized);
@@ -49,7 +60,7 @@ export async function signAndSend(input: SignSendInput): Promise<{ txHash: Hex }
 }
 
 export async function signPersonalMessage(walletName: string, messageHex: Hex): Promise<{ signature: Hex }> {
-  const key = await readWalletKey(walletName);
+  const key = await readWalletKey(walletName, `kura: sign message (${walletName})`);
   if (!key) throw new Error(`wallet ${walletName} not in keychain`);
   const normalized = (key.startsWith("0x") ? key : "0x" + key) as Hex;
   const account = privateKeyToAccount(normalized);
@@ -66,11 +77,13 @@ export async function signPersonalMessage(walletName: string, messageHex: Hex): 
 }
 
 export async function signTypedDataV4(walletName: string, json: string): Promise<{ signature: Hex }> {
-  const key = await readWalletKey(walletName);
+  const parsed = JSON.parse(json);
+  const domainName = (parsed?.domain?.name as string | undefined) ?? "typed data";
+  const reason = `kura: sign ${domainName} (${walletName})`;
+  const key = await readWalletKey(walletName, reason);
   if (!key) throw new Error(`wallet ${walletName} not in keychain`);
   const normalized = (key.startsWith("0x") ? key : "0x" + key) as Hex;
   const account = privateKeyToAccount(normalized);
-  const parsed = JSON.parse(json);
   const signature = await account.signTypedData(parsed);
   await logAudit("message_signed", { walletName, kind: "eth_signTypedData_v4" });
   return { signature };

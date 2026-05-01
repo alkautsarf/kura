@@ -14,6 +14,7 @@ import {
   exists,
   walletExists,
   signerAvailable,
+  gateBiometryOrThrow,
   readAlchemyKey,
   readEnvioToken,
   readTenderlyKey,
@@ -210,6 +211,7 @@ async function setupWallet(name: string, args: RunArgs): Promise<WalletProfile> 
     return (await createSharedKeychainWallet(name, svc, acct)).profile;
   }
   if (choice === "generate") {
+    await gateBiometryOrThrow(`kura: reveal new private key for ${name}`);
     const result = await createGeneratedWallet(name);
     console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} new wallet generated. address: ${result.profile.address}`);
     console.log(`${COLOR.yellow}IMPORTANT${COLOR.reset} private key WILL be stored in macOS Keychain only.`);

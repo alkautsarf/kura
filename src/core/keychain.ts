@@ -115,33 +115,72 @@ export function walletService(name: string): string {
 }
 export const WALLET_ACCOUNT = "key";
 
+// Serialize all kura-signer invocations so two simultaneous Touch ID prompts can't stack.
+// Without this, two dapp requests landing back-to-back would each spawn kura-signer get,
+// and the OS would queue or visually overlap the biometry sheets.
+let signerChain: Promise<unknown> = Promise.resolve();
+function signerLock<T>(fn: () => Promise<T>): Promise<T> {
+  const next = signerChain.then(fn, fn);
+  signerChain = next.catch(() => undefined);
+  return next;
+}
+
 async function runSigner(args: string[], stdin?: string): Promise<{ stdout: string; stderr: string; code: number }> {
   if (!signerBin) throw new KeychainError("kura-signer binary not found; build with `cd swift && swift build -c release`");
-  const proc = spawn({
-    cmd: [signerBin, ...args],
-    stdin: stdin ? "pipe" : "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
+  return signerLock(async () => {
+    const proc = spawn({
+      cmd: [signerBin, ...args],
+      stdin: stdin ? "pipe" : "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (stdin && proc.stdin) {
+      proc.stdin.write(stdin);
+      await proc.stdin.end();
+    }
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { stdout, stderr, code };
   });
-  if (stdin && proc.stdin) {
-    proc.stdin.write(stdin);
-    await proc.stdin.end();
-  }
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const code = await proc.exited;
-  return { stdout, stderr, code };
 }
 
 export function signerAvailable(): boolean {
   return signerBin !== null;
 }
 
-export async function readWalletKey(name: string): Promise<string | null> {
+// Standalone biometry gate (no keychain read). Used by flows that want a Touch ID confirm
+// before doing something sensitive (e.g., revealing a freshly generated private key).
+// Returns true on success, false on user cancel. Throws on hardware/policy errors.
+export async function requireBiometry(reason: string): Promise<boolean> {
+  if (!signerBin) {
+    // No signer binary = no biometry capability. Caller should treat as "skip the gate"
+    // rather than hard-fail, otherwise dev flows without the Swift binary stop working.
+    return true;
+  }
+  const { code, stderr } = await runSigner(["auth", "-m", reason]);
+  if (code === 0) return true;
+  if (code === 2) return false;
+  throw new KeychainError(`kura-signer auth failed: ${stderr.trim()}`, code);
+}
+
+// Convenience for non-TUI callers (CLI, init wizard) that want the gate to abort their flow
+// on cancel. The TUI uses requireBiometry directly so it can update component state on cancel
+// instead of throwing.
+export async function gateBiometryOrThrow(reason: string): Promise<void> {
+  const ok = await requireBiometry(reason);
+  if (!ok) throw new Error("biometry cancelled");
+}
+
+export async function readWalletKey(name: string, reason?: string): Promise<string | null> {
   if (signerBin) {
     const has = await runSigner(["has", name]);
     if (has.code !== 0) return null;
-    const { stdout, stderr, code } = await runSigner(["get", name]);
+    const args = reason ? ["get", name, "-m", reason] : ["get", name];
+    const { stdout, stderr, code } = await runSigner(args);
+    if (code === 2) {
+      throw new KeychainError("biometry cancelled", code);
+    }
     if (code !== 0) {
       throw new KeychainError(`kura-signer get failed: ${stderr.trim()}`, code);
     }
@@ -176,9 +215,11 @@ export async function walletExists(name: string): Promise<boolean> {
   return exists(walletService(name), WALLET_ACCOUNT);
 }
 
-export async function deleteWalletKey(name: string): Promise<void> {
+export async function deleteWalletKey(name: string, reason?: string): Promise<void> {
   if (signerBin) {
-    const { stderr, code } = await runSigner(["delete", name]);
+    const args = reason ? ["delete", name, "-m", reason] : ["delete", name];
+    const { stderr, code } = await runSigner(args);
+    if (code === 2) throw new KeychainError("biometry cancelled", code);
     if (code !== 0) throw new KeychainError(`kura-signer delete failed: ${stderr.trim()}`, code);
     return;
   }

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-05-01
+
+### Added
+- **Touch ID gating on every signature.** kura-signer now uses `LAContext.evaluatePolicy(.deviceOwnerAuthentication)` (with Mac-password fallback) before reading any wallet key from Keychain. Each `eth_sendTransaction`, `personal_sign`, and `eth_signTypedData_v4` pops a system Touch ID prompt with a meaningful reason string ("kura: send 0.01 ETH on Ethereum (main)", "kura: sign permit2.uniswap.org (main)"). Defense in depth: popup still shows decoded calldata + simulation + risk badge, then `[a]` triggers Touch ID before signing.
+- TUI generate flow now requires Touch ID BEFORE printing the new private key into scrollback. Headless triggers (e.g., MCP) cannot reveal a freshly generated key without a physical finger press.
+- `kura wallet migrate` subcommand. Rotates pre-v0.1.9 wallet entries (stored via plain `security` CLI, Mac-password ACL) onto the new LAContext-gated path. One Mac password prompt per wallet to read the old entry; afterwards every read pops Touch ID. TUI startup prints a one-line stderr notice when a migration is pending.
+
+### Changed
+- Swift signer (`swift/Sources/KuraSigner/main.swift`) dropped `kSecAttrAccessControl + .biometryCurrentSet`. That OS-enforced gate required a paid Apple Developer cert (the calling binary needs the keychain-access-groups entitlement); without it every `store` failed with `errSecMissingEntitlement (-34018)` and the runtime silently fell back to plain `security` CLI with no biometry. The new application-layer LAContext gate works in dev, ad-hoc-signed binaries, and brew binaries — no Apple Developer cert needed. Pattern adopted from pragma-signer's `SecureEnclave.swift`. See `feedback-touchid-lacontext-not-accesscontrol.md`.
+- Swift signer's `get` and `delete` accept a `-m <reason>` flag for the localizedReason string shown in the Touch ID prompt. New `auth` subcommand exposes the bare LAContext gate (no keychain read) for the TUI generate flow.
+- `src/core/keychain.ts` serializes all kura-signer invocations through a Promise chain (`signerLock`). Two simultaneous dapp requests will now queue Touch ID prompts back-to-back instead of stacking visually.
+- Popup status on `[a]` press changed from "approving (Touch ID)..." to "awaiting Touch ID...". Footer hint reads `[a] approve (Touch ID)`.
+
+### Fixed
+- TUI generate flow no longer leaks the private key into scrollback after quit. Previously the suspend-window `process.stdout.write` calls printed the key to the main-screen buffer, which was preserved when `resume()` switched back to alt-screen and re-revealed when the user later quit and the alt-screen exited. Fix: after the `cliConfirm("backed up?")` returns, write `\x1b[7F\x1b[J` (cursor up 7 lines + erase to end of screen) to scrub our suspend-window output. Preserves the user's shell history above kura.
+- Blinking cursor in TUI text inputs. `FormRow`'s `<input>` now passes `cursorStyle={{ style: "block", blinking: false }}` so name / address / private-key fields render with a steady cursor. Pattern matches whatsapp-tui's standard.
+
+[0.1.9]: https://github.com/alkautsarf/kura/releases/tag/v0.1.9
+
 ## [0.1.8] - 2026-05-01
 
 ### Fixed

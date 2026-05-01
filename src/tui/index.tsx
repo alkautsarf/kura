@@ -5,7 +5,7 @@ import { formatUnits, parseUnits, isAddress } from "viem";
 // @ts-expect-error qrcode-terminal has no types
 import qrcode from "qrcode-terminal";
 import { KURA_HOME } from "../core/paths.ts";
-import { getConfig, getWallet, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
+import { getConfig, getWallet, isBiometryMigrated, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
 import { getKnownChain } from "../core/chains.ts";
@@ -20,6 +20,7 @@ import {
   removeWalletWithFallback,
   walletPresence,
 } from "../core/wallet.ts";
+import { requireBiometry } from "../core/keychain.ts";
 import { confirm as cliConfirm } from "../cli/prompt.ts";
 
 interface ApiClient {
@@ -571,6 +572,7 @@ function FormRow(props: {
                 value={props.value}
                 onInput={(v: string) => props.onChange(v)}
                 placeholder={props.hint ?? ""}
+                cursorStyle={{ style: "block", blinking: false }}
               />
             )}
           </Show>
@@ -960,10 +962,19 @@ function WalletView(props: {
   async function runGenerate(): Promise<void> {
     const name = pendingName();
     setBusy(true);
-    setStatus(`generating ${name}...`);
+    setStatus(`waiting for Touch ID...`);
     const r = props.renderer as { suspend?: () => void; resume?: () => void } | null;
     let createdName: string | null = null;
     try {
+      // Gate the export-to-screen first so an attacker can't trigger this flow
+      // headlessly (e.g., via MCP) and have the key dumped to scrollback.
+      const okBio = await requireBiometry(`kura: reveal new private key for ${name}`);
+      if (!okBio) {
+        setStatus("biometry cancelled");
+        setMode("list");
+        return;
+      }
+      setStatus(`generating ${name}...`);
       const result = await createGeneratedWallet(name);
       createdName = result.profile.name;
       r?.suspend?.();
@@ -977,11 +988,13 @@ function WalletView(props: {
         if (!ok) {
           await deleteWallet(name, { purgeKey: true });
           createdName = null;
-          process.stdout.write("aborted; wallet purged from keychain.\n");
-        } else {
-          process.stdout.write(`saved as ${name}.\n`);
         }
-        process.stdout.write("\n");
+        // Erase exactly the 7 lines we wrote (leading \n, 3 IMPORTANT lines,
+        // key line, blank, "backed up? (y/N) y") so they don't reappear in the
+        // main screen buffer when the user later quits and alt-screen exits.
+        // \x1b[7F = cursor previous line 7 times; \x1b[J = erase to end of screen.
+        process.stdout.write("\x1b[7F\x1b[J");
+        process.stdout.write(createdName ? `kura: saved ${name}\n` : `kura: generation aborted\n`);
       } finally {
         r?.resume?.();
       }
@@ -1226,6 +1239,10 @@ export async function run(): Promise<void> {
     process.exit(1);
   }
   const wallet = (await getWallet(cfg.defaultWallet)) ?? all[0]!;
+  const hotWallets = all.filter((w) => !w.watchOnly && w.source !== "keychain-shared");
+  if (hotWallets.length > 0 && !(await isBiometryMigrated())) {
+    process.stderr.write("note: run 'kura wallet migrate' to enable Touch ID on existing wallets\n");
+  }
   // Pre-disable async notification modes BEFORE opentui starts touching the
   // terminal. If a prior unclean exit (e.g., kill -9) left mode 996/2031
   // enabled, opentui's own startup writes (color detection queries, alt-screen

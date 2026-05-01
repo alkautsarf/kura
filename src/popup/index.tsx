@@ -103,7 +103,11 @@ function Popup(props: PopupProps) {
       setView(view() === "outcome" ? "calldata" : "outcome");
     } else if (key.name === "a") {
       setBusy(true);
-      setStatus("approving (Touch ID)...");
+      setStatus("awaiting Touch ID...");
+      // onDecide returns once the popup→daemon decision POST completes (fast).
+      // The actual Touch ID prompt + sign happen in the daemon process AFTER the
+      // popup is gone. If the user cancels Touch ID, the dapp sees the error;
+      // we can't surface it here because the popup is already exiting.
       props.onDecide("approve").catch((e) => setStatus(`error: ${e.message}`));
     } else if (key.name === "r" || key.name === "q" || key.name === "escape") {
       setBusy(true);
@@ -168,7 +172,7 @@ function Popup(props: PopupProps) {
 
       <box marginTop={1} flexDirection="row" justifyContent="space-between">
         <box flexDirection="row">
-          <text fg="#a3be8c">[a]</text><text fg="#888"> approve  </text>
+          <text fg="#a3be8c">[a]</text><text fg="#888"> approve (Touch ID)  </text>
           <text fg="#ff8c66">[r]</text><text fg="#888"> reject  </text>
           <text fg="#88c0d0">[tab]</text><text fg="#888"> toggle  </text>
           <text fg="#888">[q] cancel</text>

@@ -91,7 +91,7 @@ export async function deleteWallet(name: string, opts: DeleteWalletOptions = {})
   await removeWallet(name);
   if (opts.purgeKey && !profile.watchOnly && profile.source !== "keychain-shared") {
     if (await walletExists(name)) {
-      await deleteWalletKey(name);
+      await deleteWalletKey(name, `kura: purge ${name} keychain entry`);
     }
   }
 }
