@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] - 2026-05-01
+
+### Changed
+- TUI App's outer box drops bottom padding (`padding={1}` split into per-side `paddingTop`/`paddingLeft`/`paddingRight`). Footer hint line now sits flush against the bottom of the alt-screen instead of floating one row above it. Maximizes vertical space for the content area on small terminals.
+
+[0.1.11]: https://github.com/alkautsarf/kura/releases/tag/v0.1.11
+
 ## [0.1.10] - 2026-05-01
 
 ### Changed
