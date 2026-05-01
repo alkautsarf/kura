@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-05-01
+
+### Changed
+- The brew formula now bundles the Swift `kura-signer` binary alongside `kura`. CI builds it on the macos-14 runner (Swift pre-installed), ad-hoc-signs it the same way as the bun-compiled `kura`, and ships both in the darwin-arm64 tarball. Brew installs them side-by-side at `/opt/homebrew/bin/kura` and `/opt/homebrew/bin/kura-signer`, which is exactly where `findSignerBinary()` in `src/core/keychain.ts` already looked. Net effect: Touch ID Just Works after `brew upgrade kura` from any directory; the manual `sudo ln -s ~/Documents/kura/swift/.build/release/kura-signer /opt/homebrew/bin/kura-signer` workaround documented for v0.1.9 is no longer needed and the existing symlink can be removed (`sudo rm /opt/homebrew/bin/kura-signer && brew upgrade kura` to switch from the symlink to the real bundled binary).
+
+### Fixed
+- `findSignerBinary()` returning null for brew users from any cwd outside `~/Documents/kura/`. Was a packaging gap — the absolute paths `/opt/homebrew/bin/kura-signer` and `/usr/local/bin/kura-signer` were already in the discovery list but the formula never installed there. v0.1.10 closes the gap.
+
+[0.1.10]: https://github.com/alkautsarf/kura/releases/tag/v0.1.10
+
 ## [0.1.9] - 2026-05-01
 
 ### Added

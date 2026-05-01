@@ -66,7 +66,7 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 **Qutebrowser shim** (`~/.qutebrowser/greasemonkey/kura.user.js`): announces kura via EIP-6963, masquerades as MetaMask, routes JSON-RPC through `GM.xmlHttpRequest` to the daemon. Per-install secret in `X-Kura-Key`.
 
-**Keys**: stored in macOS Keychain at `xyz.<wallet>.kura`. The Swift `kura-signer` binary (in `swift/`) gates every read through `LAContext.evaluatePolicy(.deviceOwnerAuthentication)`, so each signature pops a Touch ID prompt with a meaningful reason ("kura: send 0.5 ETH on Ethereum (main)"). Mac password is the automatic fallback when biometry is hardware-disabled. Without `kura-signer` (e.g. fresh clone, Swift binary not built), the runtime falls back to plain `security` CLI with Mac password on every read.
+**Keys**: stored in macOS Keychain at `xyz.<wallet>.kura`. The Swift `kura-signer` binary gates every read through `LAContext.evaluatePolicy(.deviceOwnerAuthentication)`, so each signature pops a Touch ID prompt with a meaningful reason ("kura: send 0.5 ETH on Ethereum (main)"). Mac password is the automatic fallback when biometry is hardware-disabled. Brew installs `kura-signer` alongside `kura` (since v0.1.10) so this works out of the box. For dev (`bun run dev`), build the Swift signer once: `cd swift && swift build -c release`. Without it, the runtime falls back to plain `security` CLI with Mac password on every read.
 
 ## Chains
 

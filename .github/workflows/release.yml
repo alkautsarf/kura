@@ -41,10 +41,27 @@ jobs:
           codesign --remove-signature kura-${{ matrix.target }} || true
           codesign --force --sign - kura-${{ matrix.target }}
 
+      # Build the Swift Touch ID signer alongside kura on macOS. macos-14 runners
+      # ship Swift pre-installed. LAContext is Apple-only, so this step skips on
+      # Linux. The brew formula installs both binaries to /opt/homebrew/bin so
+      # findSignerBinary() in src/core/keychain.ts resolves it from any cwd.
+      - name: Build kura-signer (macOS only)
+        if: contains(matrix.target, 'darwin')
+        run: |
+          cd swift && swift build -c release
+          cp .build/release/kura-signer ../kura-signer
+          cd ..
+          codesign --remove-signature kura-signer || true
+          codesign --force --sign - kura-signer
+
       - name: Create tarball
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          tar -czf kura-${TAG}-${{ matrix.target }}.tar.gz kura-${{ matrix.target }}
+          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
+            tar -czf kura-${TAG}-${{ matrix.target }}.tar.gz kura-${{ matrix.target }} kura-signer
+          else
+            tar -czf kura-${TAG}-${{ matrix.target }}.tar.gz kura-${{ matrix.target }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
