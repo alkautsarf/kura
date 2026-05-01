@@ -5,10 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-05-01
+
+### Changed
+- Release marker only; no functional change. Exercises the new `brew services` auto-restart-on-upgrade pipeline introduced in the v0.1.10_1 formula bump. v0.1.11 was tagged but never built — splitting the App's outer `padding={1}` into per-side `paddingTop`/`paddingLeft`/`paddingRight` to drop the bottom padding triggered a latent bun bundler / `@babel/traverse` CJS interop bug (same family as the v0.1.6 `_debug is not a function` and v0.1.7 babel regressions). Reverted the JSX prop shape; cosmetic footer-flush ask is deferred until the underlying babel/bun interop is patched (likely a postinstall script in a future release).
+
+[0.1.12]: https://github.com/alkautsarf/kura/releases/tag/v0.1.12
+
 ## [0.1.11] - 2026-05-01
 
 ### Changed
-- TUI App's outer box drops bottom padding (`padding={1}` split into per-side `paddingTop`/`paddingLeft`/`paddingRight`). Footer hint line now sits flush against the bottom of the alt-screen instead of floating one row above it. Maximizes vertical space for the content area on small terminals.
+- (aborted release — see v0.1.12)
 
 [0.1.11]: https://github.com/alkautsarf/kura/releases/tag/v0.1.11
 
