@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-05-01
+
+### Added
+- TUI wallet manager pane. Press `w` from home to list every configured wallet (default marked with `*`), `j/k` to navigate, `Enter` to set the highlighted wallet as default. `a` opens an inline add flow that prompts for the new name then a sub-menu (generate / import private key / watch-only). Generate temporarily suspends the TUI alt screen so the new private key + the same `IMPORTANT  Keychain is NOT a backup` warning the `kura init` wizard prints land in your normal terminal scrollback (so you can copy or write them down before confirming `backed up?`); answering `n` rolls back the keychain entry. `d` removes the highlighted wallet, `Shift+d` removes and purges its keychain entry too. Removing the only remaining wallet is blocked because the daemon's default would otherwise point at a missing entry.
+
+### Changed
+- TUI keymap: `w` now opens the new wallets pane and the live SSE event stream moved from `w` to `e` (events). Footer hints updated.
+
+[0.1.6]: https://github.com/alkautsarf/kura/releases/tag/v0.1.6
+
 ## [0.1.5] - 2026-04-30
 
 ### Added

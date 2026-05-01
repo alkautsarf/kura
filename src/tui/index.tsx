@@ -11,6 +11,16 @@ import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, Wa
 import { getKnownChain } from "../core/chains.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
 import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
+import {
+  createGeneratedWallet,
+  createImportedWallet,
+  createWatchOnlyWallet,
+  deleteWallet,
+  isValidWalletName,
+  removeWalletWithFallback,
+  walletPresence,
+} from "../core/wallet.ts";
+import { confirm as cliConfirm } from "../cli/prompt.ts";
 
 interface ApiClient {
   base: string;
@@ -149,7 +159,7 @@ async function reverseLookup(addr: string): Promise<string | null> {
   return null;
 }
 
-type View = "home" | "send" | "receive" | "history" | "connections" | "watch";
+type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets";
 
 interface AppProps {
   wallet: WalletProfile;
@@ -286,7 +296,8 @@ function App(props: AppProps) {
       else if (key.name === "r") setView("receive");
       else if (key.name === "h") setView("history");
       else if (key.name === "c") setView("connections");
-      else if (key.name === "w") setView("watch");
+      else if (key.name === "w") setView("wallets");
+      else if (key.name === "e") setView("watch");
       else if (key.name === "g") setTick((t) => t + 1);
       else if (key.name === "n") void toggleMode();
       else if (key.name === "tab") {
@@ -308,6 +319,8 @@ function App(props: AppProps) {
       return;
     }
     // Non-home views: only Esc returns home. Lets text input handlers see all other keys.
+    // wallets owns its escape so sub-modes (name input, add-choose, etc) can pop one level.
+    if (view() === "wallets") return;
     if (key.name === "escape") {
       setView("home");
     }
@@ -350,6 +363,15 @@ function App(props: AppProps) {
         </Show>
         <Show when={view() === "watch"}>
           <WatchView />
+        </Show>
+        <Show when={view() === "wallets"}>
+          <WalletView
+            current={wallet()}
+            onSelect={(w) => setWallet(w)}
+            onListChange={(list) => setWallets(list)}
+            onClose={() => setView("home")}
+            renderer={renderer}
+          />
         </Show>
       </box>
 
@@ -765,11 +787,408 @@ function WatchView() {
   );
 }
 
+type WalletMode = "list" | "name-add" | "add-choose" | "add-import" | "add-watch" | "confirm-remove";
+type AddChoice = "generate" | "import" | "watch";
+const ADD_CHOICES: { value: AddChoice; label: string }[] = [
+  { value: "generate", label: "generate new (random)" },
+  { value: "import", label: "import private key (paste)" },
+  { value: "watch", label: "watch-only address" },
+];
+
+function WalletView(props: {
+  current: WalletProfile;
+  onSelect: (w: WalletProfile) => void;
+  onListChange: (list: WalletProfile[]) => void;
+  onClose: () => void;
+  renderer: unknown;
+}) {
+  const [rows, setRows] = createSignal<WalletProfile[]>([]);
+  const [defaultName, setDefaultName] = createSignal<string>("");
+  const [selected, setSelected] = createSignal(0);
+  const [mode, setMode] = createSignal<WalletMode>("list");
+  const [busy, setBusy] = createSignal(false);
+  const [status, setStatus] = createSignal("");
+  const [purgeOnRemove, setPurgeOnRemove] = createSignal(false);
+
+  // pendingName carries the validated wallet name through the multi-step add flow
+  // (name-add -> add-choose -> add-import|add-watch|generate); nameInput is the
+  // unvalidated text the user is currently typing.
+  const [pendingName, setPendingName] = createSignal("");
+  const [nameInput, setNameInput] = createSignal("");
+  const [addChoice, setAddChoice] = createSignal<AddChoice>("generate");
+  const [secretInput, setSecretInput] = createSignal("");
+  const [addrInput, setAddrInput] = createSignal("");
+
+  // Triple-timeout gate that swallows the keystroke that opened the form so it
+  // doesn't bleed into the input. Same pattern SendModal uses on `s`.
+  const [inputReady, setInputReady] = createSignal(false);
+  const [mountKey, setMountKey] = createSignal(0);
+  const armTimers: ReturnType<typeof setTimeout>[] = [];
+
+  async function reload(): Promise<WalletProfile[]> {
+    const [list, cfg] = await Promise.all([listWallets(), getConfig()]);
+    setRows(list);
+    setDefaultName(cfg.defaultWallet);
+    props.onListChange(list);
+    return list;
+  }
+
+  onMount(() => {
+    void reload().then((list) => {
+      const idx = list.findIndex((w) => w.name === props.current.name);
+      setSelected(idx >= 0 ? idx : 0);
+    });
+  });
+
+  onCleanup(() => {
+    for (const t of armTimers) clearTimeout(t);
+    armTimers.length = 0;
+  });
+
+  function armInput() {
+    for (const t of armTimers) clearTimeout(t);
+    armTimers.length = 0;
+    setInputReady(false);
+    setSecretInput("");
+    setAddrInput("");
+    setNameInput("");
+    armTimers.push(setTimeout(() => {
+      setInputReady(true);
+      armTimers.push(setTimeout(() => {
+        setInputReady(false);
+        setSecretInput("");
+        setAddrInput("");
+        setNameInput("");
+        armTimers.push(setTimeout(() => {
+          setMountKey((k) => k + 1);
+          setInputReady(true);
+        }, 30));
+      }, 100));
+    }, 150));
+  }
+
+  async function handleSelectDefault(): Promise<void> {
+    const w = rows()[selected()];
+    if (!w) return;
+    if (w.name === defaultName()) return;
+    setBusy(true);
+    setStatus(`switching to ${w.name}...`);
+    try {
+      await setDefaultWallet(w.name);
+      setDefaultName(w.name);
+      props.onSelect(w);
+      setStatus(`default = ${w.name}`);
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startRemove(purge: boolean): Promise<void> {
+    if (rows().length <= 1) {
+      setStatus("can't remove last wallet, add another first");
+      return;
+    }
+    setPurgeOnRemove(purge);
+    setMode("confirm-remove");
+  }
+
+  async function performRemove(): Promise<void> {
+    const w = rows()[selected()];
+    if (!w) return;
+    setBusy(true);
+    setStatus(`removing ${w.name}${purgeOnRemove() ? " + keychain" : ""}...`);
+    try {
+      const result = await removeWalletWithFallback(w.name, { purgeKey: purgeOnRemove() });
+      const updated = await reload();
+      if (result.wasDefault && result.newDefault) {
+        const next = updated.find((x) => x.name === result.newDefault);
+        if (next) props.onSelect(next);
+      }
+      setSelected((s) => Math.max(0, Math.min(updated.length - 1, s)));
+      setStatus(`removed ${w.name}`);
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+      setMode("list");
+    }
+  }
+
+  async function startAdd(): Promise<void> {
+    setStatus("");
+    setPendingName("");
+    armInput();
+    setMode("name-add");
+  }
+
+  async function commitName(): Promise<void> {
+    const name = nameInput().trim();
+    if (!name) {
+      setStatus("name required");
+      return;
+    }
+    if (!isValidWalletName(name)) {
+      setStatus("name must be alphanumeric, _ or -");
+      return;
+    }
+    const presence = await walletPresence(name);
+    if (presence.inState) {
+      setStatus(`wallet ${name} already exists`);
+      return;
+    }
+    setPendingName(name);
+    setStatus("");
+    setAddChoice("generate");
+    setMode("add-choose");
+  }
+
+  async function pickAddChoice(): Promise<void> {
+    const choice = addChoice();
+    if (choice === "generate") {
+      await runGenerate();
+    } else if (choice === "import") {
+      armInput();
+      setMode("add-import");
+    } else {
+      armInput();
+      setMode("add-watch");
+    }
+  }
+
+  async function runGenerate(): Promise<void> {
+    const name = pendingName();
+    setBusy(true);
+    setStatus(`generating ${name}...`);
+    const r = props.renderer as { suspend?: () => void; resume?: () => void } | null;
+    let createdName: string | null = null;
+    try {
+      const result = await createGeneratedWallet(name);
+      createdName = result.profile.name;
+      r?.suspend?.();
+      try {
+        process.stdout.write("\n");
+        process.stdout.write(`IMPORTANT  new wallet generated. address: ${result.profile.address}\n`);
+        process.stdout.write(`IMPORTANT  private key WILL be stored in macOS Keychain only.\n`);
+        process.stdout.write(`IMPORTANT  Keychain is NOT a backup. Write down the key NOW:\n`);
+        process.stdout.write(`  ${result.privateKey}\n\n`);
+        const ok = await cliConfirm("backed up?", false);
+        if (!ok) {
+          await deleteWallet(name, { purgeKey: true });
+          createdName = null;
+          process.stdout.write("aborted; wallet purged from keychain.\n");
+        } else {
+          process.stdout.write(`saved as ${name}.\n`);
+        }
+        process.stdout.write("\n");
+      } finally {
+        r?.resume?.();
+      }
+      const list = await reload();
+      const idx = createdName ? list.findIndex((w) => w.name === createdName) : -1;
+      if (idx >= 0) setSelected(idx);
+      setStatus(createdName ? `added ${createdName}` : "aborted");
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+      setMode("list");
+    }
+  }
+
+  async function commitCreate(label: string, create: () => Promise<unknown>): Promise<void> {
+    const name = pendingName();
+    setBusy(true);
+    setStatus(`${label} ${name}...`);
+    try {
+      await create();
+      const list = await reload();
+      const idx = list.findIndex((w) => w.name === name);
+      if (idx >= 0) setSelected(idx);
+      setStatus(`added ${name}`);
+      setMode("list");
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function commitImport(): Promise<void> {
+    const raw = secretInput().trim();
+    if (!raw) {
+      setStatus("private key required");
+      return;
+    }
+    await commitCreate("importing", () => createImportedWallet(pendingName(), raw));
+  }
+
+  async function commitWatch(): Promise<void> {
+    const raw = addrInput().trim();
+    if (!isAddress(raw)) {
+      setStatus("invalid address");
+      return;
+    }
+    await commitCreate("adding watch-only", () => createWatchOnlyWallet(pendingName(), raw as Address));
+  }
+
+  useKeyboard((key) => {
+    if (busy()) return;
+    const m = mode();
+    if (m === "list") {
+      if (key.name === "escape") {
+        props.onClose();
+        return;
+      }
+      const list = rows();
+      if (list.length === 0) return;
+      if (key.name === "j" || key.name === "down") {
+        setSelected((s) => Math.min(list.length - 1, s + 1));
+      } else if (key.name === "k" || key.name === "up") {
+        setSelected((s) => Math.max(0, s - 1));
+      } else if (key.name === "return") {
+        void handleSelectDefault();
+      } else if (key.name === "a") {
+        void startAdd();
+      } else if (key.name === "d" && !key.shift) {
+        void startRemove(false);
+      } else if (key.name === "d" && key.shift) {
+        void startRemove(true);
+      }
+      return;
+    }
+    if (m === "name-add") {
+      if (key.name === "return") void commitName();
+      else if (key.name === "escape") {
+        setMode("list");
+        setStatus("");
+      }
+      return;
+    }
+    if (m === "add-choose") {
+      const cur = ADD_CHOICES.findIndex((c) => c.value === addChoice());
+      if (key.name === "j" || key.name === "down") {
+        setAddChoice(ADD_CHOICES[Math.min(ADD_CHOICES.length - 1, cur + 1)]!.value);
+      } else if (key.name === "k" || key.name === "up") {
+        setAddChoice(ADD_CHOICES[Math.max(0, cur - 1)]!.value);
+      } else if (key.name === "return") void pickAddChoice();
+      else if (key.name === "escape") setMode("list");
+      return;
+    }
+    if (m === "add-import") {
+      if (key.name === "return") void commitImport();
+      else if (key.name === "escape") setMode("add-choose");
+      return;
+    }
+    if (m === "add-watch") {
+      if (key.name === "return") void commitWatch();
+      else if (key.name === "escape") setMode("add-choose");
+      return;
+    }
+    if (m === "confirm-remove") {
+      if (key.name === "y") void performRemove();
+      else if (key.name === "n" || key.name === "escape") {
+        setMode("list");
+        setStatus("");
+      }
+      return;
+    }
+  });
+
+  return (
+    <box marginTop={1} flexDirection="column">
+      <text attributes={1}>wallets</text>
+      <Show when={mode() === "list"}>
+        <Show
+          when={rows().length > 0}
+          fallback={<text fg="#666">  no wallets configured</text>}
+        >
+          <For each={rows()}>
+            {(w, idx) => {
+              const tag = w.watchOnly ? "watch" : w.source === "keychain-shared" ? "shared" : w.source === "imported-private-key" ? "imported" : "generated";
+              return (
+                <text fg={idx() === selected() ? "#3ddc84" : undefined}>
+                  {`  ${idx() === selected() ? ">" : " "} ${w.name === defaultName() ? "*" : " "} ${w.name.padEnd(20)} ${fmtAddr(w.address)}  ${tag}`}
+                </text>
+              );
+            }}
+          </For>
+        </Show>
+      </Show>
+      <Show when={mode() === "name-add"}>
+        <box marginTop={1} flexDirection="column">
+          <text>  new wallet name</text>
+          <FormRow
+            label="name"
+            value={nameInput()}
+            active={true}
+            ready={inputReady()}
+            onChange={setNameInput}
+            mountKey={mountKey()}
+            hint="alphanumeric, _ or -"
+          />
+          <text fg="#888" marginTop={1}>{`  enter to continue, esc to cancel`}</text>
+        </box>
+      </Show>
+      <Show when={mode() === "add-choose"}>
+        <box marginTop={1} flexDirection="column">
+          <text>{`  add wallet "${pendingName()}"`}</text>
+          <For each={ADD_CHOICES}>
+            {(c) => (
+              <text fg={c.value === addChoice() ? "#3ddc84" : undefined}>
+                {`  ${c.value === addChoice() ? ">" : " "} ${c.label}`}
+              </text>
+            )}
+          </For>
+          <text fg="#888" marginTop={1}>{`  j/k move  enter pick  esc cancel`}</text>
+        </box>
+      </Show>
+      <Show when={mode() === "add-import"}>
+        <box marginTop={1} flexDirection="column">
+          <text>{`  import key for "${pendingName()}"`}</text>
+          <FormRow
+            label="key"
+            value={secretInput()}
+            active={true}
+            ready={inputReady()}
+            onChange={setSecretInput}
+            mountKey={mountKey()}
+            hint="0x..."
+          />
+          <text fg="#888" marginTop={1}>{`  enter to import, esc back`}</text>
+        </box>
+      </Show>
+      <Show when={mode() === "add-watch"}>
+        <box marginTop={1} flexDirection="column">
+          <text>{`  watch address for "${pendingName()}"`}</text>
+          <FormRow
+            label="addr"
+            value={addrInput()}
+            active={true}
+            ready={inputReady()}
+            onChange={setAddrInput}
+            mountKey={mountKey()}
+            hint="0x..."
+          />
+          <text fg="#888" marginTop={1}>{`  enter to save, esc back`}</text>
+        </box>
+      </Show>
+      <Show when={mode() === "confirm-remove"}>
+        <box marginTop={1} flexDirection="column">
+          <text fg="#ff8c66">{`  remove ${rows()[selected()]?.name ?? "?"}${purgeOnRemove() ? " + purge keychain" : ""}? [y/n]`}</text>
+        </box>
+      </Show>
+      <text fg={status() ? "#ffc857" : "#666"} marginTop={1}>{status()}</text>
+    </box>
+  );
+}
+
 function FooterHints(props: { view: View }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[s] send  [r] receive  [h] history  [c] connections  [w] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [g] refresh  [q] quit";
+        return "[s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mainnet/testnet  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
@@ -780,6 +1199,8 @@ function FooterHints(props: { view: View }) {
         return "j/k to move, d to revoke, esc back";
       case "watch":
         return "esc back";
+      case "wallets":
+        return "j/k move  enter set default  a add  d remove  D remove+purge  esc back";
     }
   };
   return (

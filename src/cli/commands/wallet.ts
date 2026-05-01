@@ -13,7 +13,7 @@ import {
   createSharedKeychainWallet,
   createWatchOnlyWallet,
   deleteWallet,
-  pickFallbackDefault,
+  removeWalletWithFallback,
   walletPresence,
 } from "../../core/wallet.ts";
 import { walletService, signerAvailable } from "../../core/keychain.ts";
@@ -166,9 +166,8 @@ async function useCmd(args: WalletArgs): Promise<void> {
 async function removeCmd(args: WalletArgs): Promise<void> {
   const name = args._[1];
   if (!name) throw new Error("usage: kura wallet remove <name> [--purge-key]");
-  const [profile, cfg] = await Promise.all([getWallet(name), getConfig()]);
+  const profile = await getWallet(name);
   if (!profile) throw new Error(`wallet ${name} not found`);
-  const wasDefault = cfg.defaultWallet === name;
 
   if (!args.yes) {
     const purge = args.purgeKey ? " AND delete its keychain entry" : "";
@@ -178,16 +177,14 @@ async function removeCmd(args: WalletArgs): Promise<void> {
       return;
     }
   }
-  await deleteWallet(name, { purgeKey: args.purgeKey });
+  const result = await removeWalletWithFallback(name, { purgeKey: args.purgeKey });
   console.log(`${COLOR.green}OK${COLOR.reset} removed wallet ${name}`);
   if (args.purgeKey && !profile.watchOnly && profile.source !== "keychain-shared") {
     console.log(`${COLOR.green}OK${COLOR.reset} keychain entry ${walletService(name)} deleted`);
   }
-  if (wasDefault) {
-    const fallback = await pickFallbackDefault(name);
-    if (fallback) {
-      await setDefaultWallet(fallback);
-      console.log(`${COLOR.dim}default wallet -> ${fallback}${COLOR.reset}`);
+  if (result.wasDefault) {
+    if (result.newDefault) {
+      console.log(`${COLOR.dim}default wallet -> ${result.newDefault}${COLOR.reset}`);
     } else {
       console.log(`${COLOR.yellow}WARN${COLOR.reset} that was the only wallet; default_wallet still points at ${name}. Add a new wallet with: kura wallet add <name>`);
     }

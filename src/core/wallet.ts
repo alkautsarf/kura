@@ -7,7 +7,7 @@ import {
   deleteWalletKey,
   readPassword,
 } from "./keychain.ts";
-import { upsertWallet, removeWallet, getWallet, listWallets } from "./config.ts";
+import { getConfig, getWallet, listWallets, removeWallet, setDefaultWallet, upsertWallet } from "./config.ts";
 
 export interface NewWalletResult {
   profile: WalletProfile;
@@ -113,4 +113,28 @@ export async function pickFallbackDefault(removingName: string): Promise<string 
   const wallets = await listWallets();
   const remaining = wallets.filter((w) => w.name !== removingName);
   return remaining[0]?.name ?? null;
+}
+
+const VALID_WALLET_NAME = /^[a-z0-9_-]+$/i;
+
+export function isValidWalletName(name: string): boolean {
+  return VALID_WALLET_NAME.test(name);
+}
+
+export interface RemoveWalletResult {
+  newDefault: string | null;
+  wasDefault: boolean;
+}
+
+export async function removeWalletWithFallback(
+  name: string,
+  opts: DeleteWalletOptions = {},
+): Promise<RemoveWalletResult> {
+  const cfg = await getConfig();
+  const wasDefault = cfg.defaultWallet === name;
+  await deleteWallet(name, opts);
+  if (!wasDefault) return { newDefault: cfg.defaultWallet, wasDefault: false };
+  const fallback = await pickFallbackDefault(name);
+  if (fallback) await setDefaultWallet(fallback);
+  return { newDefault: fallback, wasDefault: true };
 }
