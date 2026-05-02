@@ -51,7 +51,19 @@ export async function getClient(chainId: number): Promise<PublicClient> {
   const key = await getAlchemyKey();
   const url = resolveRpcUrl(chain, key);
   const viemChain = chainToViem(chain, url);
-  const client = createPublicClient({ chain: viemChain, transport: http(url) }) as PublicClient;
+  // viem's http transport defaults to no timeout (relies on fetch defaults),
+  // so when Alchemy hangs (sticky DNS, idle connection close, slow upstream)
+  // a single eth_getBalance can block portfolio loads for 30-60+ seconds.
+  // Cap at 5s and retry twice with 200ms backoff so transient blips self-heal
+  // but the worst case stays bounded (~5.5s total: 5s + 0.2s + 0.3s of retry).
+  const client = createPublicClient({
+    chain: viemChain,
+    transport: http(url, {
+      timeout: 5_000,
+      retryCount: 2,
+      retryDelay: 200,
+    }),
+  }) as PublicClient;
   clientCache.set(chainId, client);
   return client;
 }

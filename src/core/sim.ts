@@ -62,25 +62,34 @@ export async function simulate(input: SimInput, cfg: SimConfig = {}): Promise<Si
     // for the very calls that need them most.
     simulation_type: "full",
   };
+  // Full simulation_type is slow — Uniswap V4 Universal Router swaps can take
+  // 10-12s for Tenderly to fully trace. First attempt 15s. On timeout retry
+  // once with 8s cap (slow path is usually a cold cache; retry typically lands
+  // fast). Retry only on the literal "tenderly timeout" — other errors (4xx,
+  // network, malformed JSON) shape the response immediately and shouldn't retry.
+  const callTenderly = (timeoutMs: number) => withTimeout(
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Access-Key": c.key },
+      body: JSON.stringify(body),
+    }),
+    timeoutMs,
+    "tenderly timeout",
+  );
   let resp: Response;
   try {
-    resp = await withTimeout(
-      fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Access-Key": c.key,
-        },
-        body: JSON.stringify(body),
-      }),
-      // Full simulation_type is slow — Uniswap V4 Universal Router swaps can
-      // take 10-12s for Tenderly to fully trace. 15s caps the wait while still
-      // being responsive enough for the popup to land in time.
-      15000,
-      "tenderly timeout",
-    );
+    resp = await callTenderly(15000);
   } catch (err) {
-    return { ok: false, reason: (err as Error).message, diffs: [] };
+    if ((err as Error).message === "tenderly timeout") {
+      console.warn("[sim] tenderly timeout on first attempt, retrying with 8s cap");
+      try {
+        resp = await callTenderly(8000);
+      } catch (err2) {
+        return { ok: false, reason: (err2 as Error).message, diffs: [] };
+      }
+    } else {
+      return { ok: false, reason: (err as Error).message, diffs: [] };
+    }
   }
   if (!resp.ok) {
     return {

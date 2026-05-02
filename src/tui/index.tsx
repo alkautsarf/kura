@@ -132,6 +132,25 @@ function fmtActivityAmount(raw: string, decimals: number | undefined, symbol: st
   // Spam: raw value > 10^36 (1 trillion units even at 24 decimals) is almost
   // always airdrop spam, not real value.
   if (big > 10n ** 36n) return `[spam] ${symbol}`;
+  // Native EVM amounts (18 decimals): sub-microether values render as wei/gwei
+  // so 1 wei displays as "1 wei" instead of "1.000e-18 ETH" (unreadable). Use
+  // decimal ETH only once the amount is >= 1 milliether where the decimal
+  // representation has fewer than 4 leading zeros after the dot.
+  if (dec === 18) {
+    const abs = big < 0n ? -big : big;
+    const sign = big < 0n ? "-" : "";
+    if (abs < 1_000_000_000n) {
+      // sub-gwei: render as raw wei (single integer, no decimals)
+      return `${sign}${abs.toString()} wei`;
+    }
+    if (abs < 1_000_000_000_000_000n) {
+      // 1 gwei to 1 milliether: render as gwei
+      const gweiNum = Number(abs) / 1e9;
+      const gweiStr = (gweiNum >= 1 ? gweiNum.toFixed(2) : gweiNum.toFixed(4))
+        .replace(/0+$/, "").replace(/\.$/, "");
+      return `${sign}${gweiStr} gwei`;
+    }
+  }
   const text = formatUnits(big, dec);
   const num = Number(text);
   if (!Number.isFinite(num)) return `[huge] ${symbol}`;
@@ -139,7 +158,12 @@ function fmtActivityAmount(raw: string, decimals: number | undefined, symbol: st
   let formatted: string;
   const abs = Math.abs(num);
   if (abs === 0) formatted = "0";
-  else if (abs < 1e-9) formatted = num.toExponential(3);
+  else if (abs < 1e-9) {
+    // Avoid scientific notation entirely. Tiny ERC20 amounts that aren't
+    // worth showing precisely get a "<0.0000001" placeholder; matches the
+    // way most wallets show dust.
+    formatted = num < 0 ? "-<0.0000001" : "<0.0000001";
+  }
   else if (abs < 1e-4) formatted = num.toFixed(8);
   else if (abs < 1) formatted = num.toFixed(6);
   else if (abs < 1000) formatted = num.toFixed(4);
@@ -205,6 +229,20 @@ function fmtAge(ts: number): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
+}
+
+// Toggle debug keystroke / lifecycle logging by setting KURA_TUI_DEBUG=1. Writes
+// to /tmp/kura-tui-keys.log. Used for diagnosing input pipeline bugs (e.g. the
+// DEC 997 flood that drowned out ESC keystrokes pre-v0.1.19); off by default
+// because the appendFileSync per byte adds measurable overhead.
+const DEBUG_LOG = process.env.KURA_TUI_DEBUG === "1";
+function dbglog(msg: string): void {
+  if (!DEBUG_LOG) return;
+  try {
+    const t = process.hrtime.bigint();
+    const ts = `${(Number(t) / 1e6).toFixed(3)}`;
+    require("node:fs").appendFileSync("/tmp/kura-tui-keys.log", `${ts}ms ${msg}\n`);
+  } catch { /* best effort */ }
 }
 
 function qrLines(text: string): Promise<string[]> {
@@ -425,10 +463,11 @@ function App(props: AppProps) {
     historyCtrl?.abort();
   });
 
-  // Reset cursor on view/wallet/chain changes so the highlight doesn't dangle
-  // off the end of a refreshed list.
+  // Reset cursor when wallet or chain changes (the underlying activity list is
+  // different so old cursor is meaningless). Keep cursor when toggling between
+  // home and history (same data shape) and across tx-detail in/out so the user
+  // can drill down on a row, esc, and continue browsing from where they were.
   createEffect(() => {
-    void view();
     void wallet().address;
     void committedChainId();
     setCursor(0);
@@ -453,6 +492,28 @@ function App(props: AppProps) {
     setView("tx");
   }
 
+  // Kill opentui's theme-mode handler and re-disable color-scheme notifications.
+  // Why: Ghostty (and likely other modern terminals) fires `\x1B[?997;1n` at
+  // ~11k events/sec when DEC 996/2031 are enabled. opentui's themeModeHandler
+  // responds to each by querying OSC 10/11, terminal replies, and the flood
+  // drowns out user keystrokes (ESC, etc) until the parser drains on focus
+  // loss. Disabling the modes once at startup is not enough because opentui's
+  // native setup re-enables them; writing directly to stdout sidesteps the
+  // renderer pipeline and the input handler removal kills the query loop.
+  onMount(() => {
+    try {
+      const r = renderer as unknown as {
+        removeInputHandler?: (h: unknown) => void;
+        themeModeHandler?: unknown;
+      };
+      if (r.themeModeHandler && r.removeInputHandler) {
+        r.removeInputHandler(r.themeModeHandler);
+      }
+    } catch { /* private API, best-effort */ }
+    try {
+      process.stdout.write("\x1b[?996l\x1b[?2031l\x1b[?2048l");
+    } catch { /* best-effort */ }
+  });
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
       quit(0);
@@ -550,7 +611,9 @@ function App(props: AppProps) {
       <Show when={view() === "home"}>
         <HomeView
           portfolio={portfolio()}
+          portfolioLoading={portfolio.loading}
           history={history()}
+          historyLoading={history.loading}
           chain={chain()}
           showUnverified={showUnverified()}
           cursor={cursor()}
@@ -563,7 +626,7 @@ function App(props: AppProps) {
         <ReceiveModal wallet={wallet()} chain={chain()} />
       </Show>
       <Show when={view() === "history"}>
-        <HistoryView items={(history()?.items ?? []).slice(0, 50)} chain={chain()} cursor={cursor()} />
+        <HistoryView items={(history()?.items ?? []).slice(0, 50)} chain={chain()} cursor={cursor()} loading={history.loading} loaded={history() !== undefined} />
       </Show>
       <Show when={view() === "tx"}>
         <TxDetailView
@@ -574,6 +637,7 @@ function App(props: AppProps) {
           mode={txDetailMode()}
           onModeChange={setTxDetailMode}
           onCopyToast={showCopyToast}
+          onClose={() => { setView(txReturnView()); setTxItem(null); }}
         />
       </Show>
       <Show when={view() === "connections"}>
@@ -614,16 +678,27 @@ function ActivityRow(props: {
   selected?: boolean;
 }) {
   const it = props.it;
+  const isSelf = it.direction === "self";
   const counter = it.direction === "out" ? it.to : it.from;
   const name = counter ? props.resolved[counter.toLowerCase()] : null;
-  const counterDisplay = name ?? fmtAddr(counter);
-  const arrowChar = it.direction === "out" ? "-" : it.direction === "in" ? "+" : " ";
-  const arrowColor = it.direction === "out" ? ROW_COLORS.outArrow : it.direction === "in" ? ROW_COLORS.inArrow : ROW_COLORS.dim;
+  // Self-transfers: counter party is the wallet itself; showing the address
+  // again is noise. Use the tx hash for the right column instead so the row
+  // surfaces something useful (and matches history view's hash column).
+  const counterDisplay = isSelf ? fmtAddr(it.hash, 4) : (name ?? fmtAddr(counter));
+  const arrowChar = it.direction === "out" ? "-" : it.direction === "in" ? "+" : isSelf ? "↻" : " ";
+  const arrowColor = it.direction === "out" ? ROW_COLORS.outArrow : it.direction === "in" ? ROW_COLORS.inArrow : isSelf ? ROW_COLORS.amount : ROW_COLORS.dim;
   // Build the description (or fall back for raw native/erc20 rows that the
-  // daemon couldn't enrich with semantics).
+  // daemon couldn't enrich with semantics). Self-transfers don't go through the
+  // daemon enrichment path because there's no useful semantic to decode (no
+  // counter party transfer), so format here with a friendlier "Self transfer"
+  // label instead of the raw amount which renders as "1.000e-18 ETH" for 1 wei.
   const description = it.description ?? (() => {
     const symbol = it.kind === "erc20" ? (it.symbol ?? fmtAddr(it.token, 4)) : (props.chain?.symbol ?? "ETH");
     const dec = it.kind === "erc20" ? it.decimals : 18;
+    if (isSelf) {
+      const amt = fmtActivityAmount(it.value, dec, symbol);
+      return `Self transfer ${amt}`;
+    }
     return fmtActivityAmount(it.value, dec, symbol);
   })();
   const segments = colorizeDescription(description);
@@ -671,7 +746,9 @@ function ActivityRow(props: {
 
 function HomeView(props: {
   portfolio: Portfolio | null | undefined;
+  portfolioLoading: boolean;
   history: { items: ActivityItem[] } | undefined;
+  historyLoading: boolean;
   chain: KuraChainConfig | undefined;
   showUnverified: boolean;
   cursor: number;
@@ -714,6 +791,9 @@ function HomeView(props: {
           <text attributes={1} fg={props.portfolio ? "#a3be8c" : "#888"}>
             {props.portfolio ? fmtUsd(props.portfolio.totalUsd) : "loading..."}
           </text>
+          <Show when={props.portfolio && props.portfolioLoading}>
+            <text fg="#666">  (refreshing)</text>
+          </Show>
         </box>
         <Show when={props.portfolio}>
           <box marginTop={1} flexDirection="column">
@@ -741,9 +821,16 @@ function HomeView(props: {
         </Show>
       </box>
       <box marginTop={1} flexDirection="column">
-        <text attributes={1}>Recent Activity</text>
+        <box flexDirection="row">
+          <text attributes={1}>Recent Activity</text>
+          <Show when={props.historyLoading && props.history}>
+            <text fg="#666">  (refreshing)</text>
+          </Show>
+        </box>
         <box marginTop={1} flexDirection="column">
-          <Show when={items().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no recent activity</text>}>
+          <Show when={items().length > 0} fallback={
+            <text fg={ROW_COLORS.dim}>{props.historyLoading || !props.history ? "  loading recent activity..." : "  no recent activity"}</text>
+          }>
             <For each={items()}>
               {(it, idx) => (
                 <ActivityRow
@@ -993,20 +1080,22 @@ function TxDetailView(props: {
   mode: "overview" | "data";
   onModeChange: (mode: "overview" | "data") => void;
   onCopyToast?: (msg: string) => void;
+  onClose: () => void;
 }) {
   const item = () => props.item;
   const mode = () => props.mode;
   const setMode = (m: "overview" | "data") => props.onModeChange(m);
   const [scroll, setScroll] = createSignal(0);
+  const fetchHash = () => item()?.hash ?? null;
   const [receipt] = createResource(
-    () => item()?.hash ?? null,
+    fetchHash,
     async (hash) => {
       if (!hash) return null;
       return rpcCall<TxReceipt>(props.chainId, "eth_getTransactionReceipt", [hash]);
     },
   );
   const [tx] = createResource(
-    () => item()?.hash ?? null,
+    fetchHash,
     async (hash) => {
       if (!hash) return null;
       return rpcCall<TxFull>(props.chainId, "eth_getTransactionByHash", [hash]);
@@ -1065,6 +1154,13 @@ function TxDetailView(props: {
     void openUrl(`${explorer.replace(/\/$/, "")}/tx/${it.hash}`);
   }
   useKeyboard((key) => {
+    // Owns escape so we can reset data-mode scroll back to overview before
+    // unmounting, rather than leaving the next tx-detail open in data mode.
+    if (key.name === "escape") {
+      if (mode() === "data") setMode("overview");
+      props.onClose();
+      return;
+    }
     if (mode() === "overview") {
       if (key.name === "tab" && item()?.hash) { setMode("data"); setScroll(0); return; }
       if (key.name === "c") { copyHash(); return; }
@@ -1238,7 +1334,7 @@ function TxDetailView(props: {
   );
 }
 
-function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | undefined; cursor: number }) {
+function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | undefined; cursor: number; loading: boolean; loaded: boolean }) {
   const [resolved, setResolved] = createSignal<Record<string, string | null>>({});
   // History view shows everything including dust (with a [dust] tag) so the
   // user can audit; only HomeView hides them outright.
@@ -1265,9 +1361,16 @@ function HistoryView(props: { items: ActivityItem[]; chain: KuraChainConfig | un
   const overflow = () => Math.max(0, props.items.length - MAX_ROWS);
   return (
     <box marginTop={1} flexDirection="column">
-      <text attributes={1}>history</text>
+      <box flexDirection="row">
+        <text attributes={1}>history</text>
+        <Show when={props.loading && props.loaded}>
+          <text fg="#666">  (refreshing)</text>
+        </Show>
+      </box>
       <box marginTop={1} flexDirection="column">
-        <Show when={visible().length > 0} fallback={<text fg={ROW_COLORS.dim}>  no activity</text>}>
+        <Show when={visible().length > 0} fallback={
+          <text fg={ROW_COLORS.dim}>{props.loading || !props.loaded ? "  loading activity..." : "  no activity"}</text>
+        }>
           <For each={visible()}>
             {(it, idx) => (
               <ActivityRow
@@ -1894,6 +1997,20 @@ export async function run(): Promise<void> {
   // still routes through quit(), which is a no-op on the renderer in that
   // window but still disables modes and drains stdin via the 'exit' handler.
   attachRestoreHandlers();
+  if (DEBUG_LOG) {
+    try { require("node:fs").writeFileSync("/tmp/kura-tui-keys.log", `=== TUI started ${new Date().toISOString()} ===\n`); } catch {}
+    // Mirror raw stdin bytes when KURA_TUI_DEBUG=1 so we can diagnose input
+    // pipeline issues. Removed on process exit so a hot-reload doesn't double
+    // the listener.
+    const stdinListener = (chunk: Buffer) => {
+      try {
+        const hex = Array.from(chunk).map((b) => b.toString(16).padStart(2, "0")).join(" ");
+        dbglog(`[stdin] ${chunk.length}B raw=${hex}`);
+      } catch {}
+    };
+    process.stdin.on("data", stdinListener);
+    process.once("exit", () => process.stdin.removeListener("data", stdinListener));
+  }
   // exitSignals: [] tells opentui's CliRenderer NOT to register its own
   // SIGINT/SIGTERM/etc. listeners. We own all signal handling so the
   // disable -> destroy -> drain ordering is preserved. Without this, opentui

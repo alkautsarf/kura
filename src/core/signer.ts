@@ -46,7 +46,10 @@ export async function signAndSend(input: SignSendInput): Promise<{ txHash: Hex }
   const walletClient = createWalletClient({
     account,
     chain: { id: chain.id, name: chain.name, nativeCurrency: { name: chain.symbol, symbol: chain.symbol, decimals: 18 }, rpcUrls: { default: { http: [url] } } },
-    transport: http(url),
+    // Cap Alchemy hangs at 5s + 2 retries, same as the read client in rpc.ts.
+    // Without this a sticky DNS or idle-closed connection on the write path
+    // blocks the popup signer indefinitely.
+    transport: http(url, { timeout: 5_000, retryCount: 2, retryDelay: 200 }),
   });
   const txHash = await walletClient.sendTransaction({
     to: input.to ?? undefined,

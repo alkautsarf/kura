@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19] - 2026-05-02
+
+### Fixed
+- Tx detail ESC was unresponsive until the user blurred the terminal and refocused. Root cause: Ghostty floods stdin with `\x1B[?997;1n` color-scheme notifications at ~11k/sec when DEC 996/2031 are enabled, opentui's `themeModeHandler` answers each with OSC 10/11 color queries, and the parser starves for keystrokes. Fix removes the handler at App mount and re-writes `\x1B[?996l\x1B[?2031l\x1B[?2048l` to stdout (opentui's native setup re-enables them). Stdin drops from ~11k/sec to ~1/sec; ESC lands in ~115ms.
+- Cold portfolio could hang 30-60s when Alchemy had a transient blip. viem's `http` transport had no timeout. Capped at 5s with 2 retries (200ms backoff) for both read and write clients. Cold base portfolio: 41s -> 1.2s. Cold mainnet: 18.9s -> 379ms.
+- Shim `req()` retries up to 3x with 200ms backoff on `status=0` (transport never reached daemon). Only retries on transport failure to avoid duplicate `/requests` entries when the daemon already responded. Brief outages from `brew upgrade kura` or `launchctl kickstart` no longer leave dapp tabs with eternal spinners. Re-run `kura install-shim --force` and reload dapp tabs to pick up the new shim.
+- Tenderly `/simulate` retries once with an 8s cap if the first 15s attempt times out, so cold-cache slowness no longer surfaces `[DANGER] simulation failed` for txs that succeed on retry.
+- Popup `BalanceBox` copy branches on `semantic.kind`. Approve/permit keeps "no balance change (allowance only)"; everything else (self-transfers, opaque router calls) shows "no net balance change".
+
+### Changed
+- Self-transfers in the activity list render as `↻ Self transfer 1 wei` (cyan loop arrow + tx hash in the counter column) instead of `1.000e-18 ETH` next to the wallet's own address.
+- Native EVM amounts under 1 milliether render in `wei` or `gwei` instead of scientific notation. ERC20 sub-microformat amounts show `<0.0000001` instead of `1.000e-7`.
+- Activity cursor position is preserved when entering and exiting tx detail. Cursor still resets when wallet or chain changes.
+
+### Added
+- TUI loading state distinguishes loading from empty in HomeView and HistoryView. Cold start shows "loading recent activity..." instead of "no recent activity"; a dim "(refreshing)" tag appears next to section headers during background refetches.
+
+[0.1.19]: https://github.com/alkautsarf/kura/releases/tag/v0.1.19
+
 ## [0.1.18] - 2026-05-02
 
 ### Added

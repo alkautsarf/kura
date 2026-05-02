@@ -25,31 +25,57 @@ export const USERSCRIPT_TEMPLATE = `// ==UserScript==
 
   var gm = (typeof GM !== "undefined" && GM.xmlHttpRequest) ? GM.xmlHttpRequest : (typeof GM_xmlhttpRequest !== "undefined" ? GM_xmlhttpRequest : null);
 
+  // 3 attempts total with 200ms backoff. Only retry on transport failure
+  // (status=0 = ECONNREFUSED / connection never reached daemon, e.g., briefly
+  // mid brew-upgrade or launchctl-kickstart). Non-zero status means the daemon
+  // received the request and responded; retrying would risk creating duplicate
+  // /requests entries (two popups for one user click).
   function req(path, body) {
     return new Promise(function (resolve, reject) {
-      if (!gm) {
-        fetch(BASE + path, {
+      var attemptsLeft = 3;
+      function attempt() {
+        attemptsLeft -= 1;
+        if (!gm) {
+          fetch(BASE + path, {
+            method: body ? "POST" : "GET",
+            headers: { "X-Kura-Key": SECRET, "Content-Type": "application/json" },
+            body: body ? JSON.stringify(body) : undefined,
+          }).then(function (r) { return r.json(); }).then(resolve, function (e) {
+            if (attemptsLeft > 0) { setTimeout(attempt, 200); return; }
+            reject(e);
+          });
+          return;
+        }
+        gm({
           method: body ? "POST" : "GET",
+          url: BASE + path,
           headers: { "X-Kura-Key": SECRET, "Content-Type": "application/json" },
-          body: body ? JSON.stringify(body) : undefined,
-        }).then(function (r) { return r.json(); }).then(resolve, reject);
-        return;
+          data: body ? JSON.stringify(body) : undefined,
+          onload: function (r) {
+            try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error("kura: bad json: " + (r.responseText||"").slice(0,80))); }
+          },
+          onerror: function (e) {
+            var status = e && e.status;
+            if (attemptsLeft > 0 && (!status || status === 0)) {
+              console.warn("kura: transport failure (status=" + status + "), retrying in 200ms (" + attemptsLeft + " left)");
+              setTimeout(attempt, 200);
+              return;
+            }
+            var info = "kura GM.xhr error: status=" + status + " statusText=" + (e && e.statusText) + " readyState=" + (e && e.readyState);
+            console.error(info, e);
+            reject(new Error(info));
+          },
+          ontimeout: function () {
+            if (attemptsLeft > 0) {
+              console.warn("kura: GM.xhr timeout, retrying in 200ms (" + attemptsLeft + " left)");
+              setTimeout(attempt, 200);
+              return;
+            }
+            reject(new Error("kura GM.xhr timeout"));
+          },
+        });
       }
-      gm({
-        method: body ? "POST" : "GET",
-        url: BASE + path,
-        headers: { "X-Kura-Key": SECRET, "Content-Type": "application/json" },
-        data: body ? JSON.stringify(body) : undefined,
-        onload: function (r) {
-          try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error("kura: bad json: " + (r.responseText||"").slice(0,80))); }
-        },
-        onerror: function (e) {
-          var info = "kura GM.xhr error: status=" + (e && e.status) + " statusText=" + (e && e.statusText) + " readyState=" + (e && e.readyState);
-          console.error(info, e);
-          reject(new Error(info));
-        },
-        ontimeout: function () { reject(new Error("kura GM.xhr timeout")); },
-      });
+      attempt();
     });
   }
 

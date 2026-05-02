@@ -617,7 +617,7 @@ function BalanceBox(props: {
             fallback={<text fg={COLORS.dim}>  simulating...</text>}
           >
             <Show when={props.sim!.ok} fallback={<text fg={COLORS.bad}>  simulation failed: {props.sim!.reason}</text>}>
-              <text fg={COLORS.dim}>  no balance change (allowance only)</text>
+              <NoDiffsMessage semantic={props.semantic} />
             </Show>
           </Show>
         }
@@ -647,6 +647,18 @@ function BalanceBox(props: {
       </Show>
     </box>
   );
+}
+
+// Sim succeeded but produced no balance diffs. Branch on semantic kind so the
+// copy is accurate: approve/permit really are allowance-only; everything else
+// (self-transfer, opaque router calls Tenderly couldn't trace) shows the
+// generic "no net balance change" line.
+function NoDiffsMessage(props: { semantic: SemanticTx | undefined }) {
+  const k = props.semantic?.kind;
+  if (k === "approve" || k === "permit") {
+    return <text fg={COLORS.dim}>  no balance change (allowance only)</text>;
+  }
+  return <text fg={COLORS.dim}>  no net balance change</text>;
 }
 
 function CalldataView(props: { semantic: SemanticTx | undefined; payload: Record<string, unknown>; kind: string; scroll: number }) {
