@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.20] - 2026-05-02
+
+### Added
+- Hot chains via `~/.kura/chains.toml` are now visible to every sync caller (rpc client, signer, balance, history, decoder). Previously the loader read the file but `getKnownChain(id)` ignored hot entries, so the daemon would reject a hot chain id with "unknown chain" before any RPC could happen. New `reloadHotChains()` in `core/chains.ts` mirrors the on-disk list into an in-memory cache; daemon, TUI, CLI, and popup all pre-warm it on startup.
+- `kura chain` CLI subcommand (list / add / remove / show). `kura chain add <id> <rpc>` validates the RPC by calling `eth_chainId` and refuses if the response doesn't match the expected id, then prompts for name / symbol / explorer / testnet / hypersync / alchemy slug, writes `chains.toml` atomically (temp + rename), and reloads the hot cache. Bundled chain ids cannot be overridden.
+- TUI Networks view (Shift+N). Lists all chains (bundled + hot) with `*` for current and `hot`/`bundled` source tag. Inline add flow: chain id -> RPC -> RPC validation -> name / symbol / explorer / testnet form -> commit. Selecting a testnet chain auto-toggles network mode. `d` removes a hot chain (bundled chains untouched).
+- TUI ERC20 send. SendModal reads the active portfolio (cached daemon-side, 15s TTL), looks up the token by symbol, encodes the transfer calldata via the new shared `encodeErc20Transfer` helper (viem `encodeFunctionData`), and posts to `/requests` like a native send. `$N` USD syntax derives the unit price from the portfolio's USD total. CLI `kura send` shares the same encoder.
+- Activity fallback for chains without HyperSync. `fetchActivity` now reads `tx_signed` audit log entries for the active chain, fetches each tx via `eth_getTransaction` + `eth_getBlock` (one block call per unique block), and surfaces outbound rows so users can see the sends they just made on rpc-only hot chains.
+- Address-poisoning dust filter. `markPoisonAttempts` flags any tiny inbound (< 0.0001 ETH or < 0.01 token units) as dust when the sender address shares 3+ leading or trailing hex chars with a recent outbound recipient (vanity-grind poisoning), or when there's no prefix match but we have other recent sends (blind dust spray). Dust rows fold into the "+ N dust/spam txs hidden" line.
+
+### Changed
+- Risk engine: `sim-failed` rule downgrades from `danger` to `review` when the chain's simulation capability is `rpc-only` (no Tenderly support). Sending native OG on 0G testnet no longer surfaces "[DANGER] simulation failed" just because Tenderly returned 500.
+- Popup `BalanceBox` shows "no simulation available for this chain" instead of "simulation failed: tenderly 500" when the chain is rpc-only. `simulate()` short-circuits before the Tenderly call, so the popup no longer hangs on "simulating..." for the 23s timeout window.
+- `core/balance.ts` `tokenBalances()` and `getSpamContracts()` short-circuit to empty results when the chain has no `alchemyNetwork`. Previously they threw `"no alchemy network for chain X"` which crashed `buildPortfolio`'s Promise.all for any non-Alchemy chain.
+- `fmtTok` shows up to 4 significant decimals for amounts >= 1, trimming trailing zeros, so a 0.001 OG send is visible as `4.9989` instead of `5.00`.
+
+### Internal
+- `readAudit` accepts a `type` filter that pre-screens lines via substring before JSON.parse, then post-validates after parse. Audit log already grows unbounded, so this avoids re-parsing thousands of unrelated events on every history fetch.
+- `encodeErc20Transfer(to, amount)` extracted to `core/decode-tx.ts`; CLI and TUI now share one ERC20 transfer encoder.
+- `DEFAULT_HOT_CAPABILITIES` constant + `mergeChains(hot)` helper added to `core/chains.ts` so CLI and TUI add flows can't drift on capability defaults.
+
+[0.1.20]: https://github.com/alkautsarf/kura/releases/tag/v0.1.20
+
 ## [0.1.19] - 2026-05-02
 
 ### Fixed

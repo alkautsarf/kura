@@ -1,6 +1,7 @@
 import mri from "mri";
 import { COLOR } from "./format.ts";
 import { checkDaemon } from "./client.ts";
+import { reloadHotChains } from "../core/chains.ts";
 
 export async function run(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
@@ -9,7 +10,9 @@ export async function run(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const NO_DAEMON_NEEDED = new Set(["init", "daemon", "popup", "proxy", "wallet"]);
+  await reloadHotChains();
+
+  const NO_DAEMON_NEEDED = new Set(["init", "daemon", "popup", "proxy", "wallet", "chain"]);
   if (!NO_DAEMON_NEEDED.has(cmd)) {
     const ok = await checkDaemon();
     if (!ok) {
@@ -93,6 +96,11 @@ export async function run(argv: string[]): Promise<void> {
         };
         const { run } = await import("./commands/wallet.ts");
         return await run(normalized);
+      }
+      case "chain": {
+        const args = mri<any>(rest, { boolean: ["yes"], alias: { y: "yes" } });
+        const { run } = await import("./commands/chain.ts");
+        return await run({ _: args._, yes: args.yes });
       }
       case "init": {
         const args = mri<any>(rest, {

@@ -22,6 +22,10 @@ interface AlchemyMetadata {
   logo?: string;
 }
 
+function hasAlchemy(chainId: number): boolean {
+  return !!getKnownChain(chainId)?.alchemyNetwork;
+}
+
 async function alchemyRpc<T>(chainId: number, method: string, params: unknown[]): Promise<T> {
   const chain = getKnownChain(chainId);
   if (!chain?.alchemyNetwork) throw new Error(`no alchemy network for chain ${chainId}`);
@@ -48,6 +52,11 @@ const spamCache = new Map<number, Set<string>>();
 export async function getSpamContracts(chainId: number): Promise<Set<string>> {
   const cached = spamCache.get(chainId);
   if (cached) return cached;
+  if (!hasAlchemy(chainId)) {
+    const empty = new Set<string>();
+    spamCache.set(chainId, empty);
+    return empty;
+  }
   try {
     const result = await alchemyRpc<string[]>(chainId, "alchemy_getSpamContracts", []);
     const set = new Set(result.map((a) => a.toLowerCase()));
@@ -67,6 +76,7 @@ export async function nativeBalance(chainId: number, address: Address): Promise<
 const MAX_TOKENS_WITH_METADATA = 30;
 
 export async function tokenBalances(chainId: number, address: Address): Promise<PortfolioToken[]> {
+  if (!hasAlchemy(chainId)) return [];
   const result = await alchemyRpc<{ tokenBalances: AlchemyBalance[] }>(chainId, "alchemy_getTokenBalances", [address, "erc20"]);
   const nonZero = result.tokenBalances.filter((b) => b.tokenBalance && BigInt(b.tokenBalance) > 0n);
   nonZero.sort((a, b) => {

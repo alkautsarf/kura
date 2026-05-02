@@ -1,7 +1,14 @@
-import { readFile } from "node:fs/promises";
+import { readFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import type { KuraChainConfig } from "./types.ts";
+import type { ChainCapabilities, KuraChainConfig } from "./types.ts";
 import { PATH_CHAINS } from "./paths.ts";
+
+export const DEFAULT_HOT_CAPABILITIES: ChainCapabilities = {
+  history: "rpc-only",
+  simulation: "rpc-only",
+  risk: "minimal",
+  contractSource: "none",
+};
 
 const ALCHEMY_PLACEHOLDER = "${ALCHEMY}";
 
@@ -141,7 +148,17 @@ const KNOWN_BY_ID = new Map<number, KuraChainConfig>(
   [...BUNDLED_CHAINS, ...KNOWN_TESTNETS].map((c) => [c.id, c]),
 );
 
+// Hot chains live on disk in chains.toml. Sync callers (rpc.ts, signer.ts,
+// balance.ts, etc.) need them visible without an await, so we mirror the file
+// in-memory. Each entry point (daemon, TUI, CLI, popup) calls reloadHotChains
+// once at startup to populate it; writeHotChains refreshes it after a write.
+const hotCache = new Map<number, KuraChainConfig>();
+
 export function getKnownChain(id: number): KuraChainConfig | undefined {
+  return KNOWN_BY_ID.get(id) ?? hotCache.get(id);
+}
+
+export function getBundledChain(id: number): KuraChainConfig | undefined {
   return KNOWN_BY_ID.get(id);
 }
 
@@ -154,6 +171,7 @@ interface HotLoadEntry {
   name?: string;
   symbol?: string;
   tier?: 1 | 2;
+  testnet?: boolean;
   rpcUrl?: string;
   rpc_url?: string;
   explorer?: string;
@@ -183,13 +201,11 @@ function normalizeHotEntry(e: HotLoadEntry): KuraChainConfig {
     name: e.name ?? `Chain ${e.id}`,
     symbol: e.symbol ?? "ETH",
     tier: e.tier ?? 2,
+    testnet: e.testnet,
     rpcUrl: e.rpcUrl ?? e.rpc_url ?? "",
     explorer: e.explorer ?? "",
     capabilities: {
-      history: "rpc-only",
-      simulation: "rpc-only",
-      risk: "minimal",
-      contractSource: "none",
+      ...DEFAULT_HOT_CAPABILITIES,
       ...(e.capabilities ?? {}),
     },
   };
@@ -198,6 +214,7 @@ function normalizeHotEntry(e: HotLoadEntry): KuraChainConfig {
     name: e.name ?? base.name,
     symbol: e.symbol ?? base.symbol,
     tier: e.tier ?? base.tier,
+    testnet: e.testnet ?? base.testnet,
     rpcUrl: e.rpcUrl ?? e.rpc_url ?? base.rpcUrl,
     explorer: e.explorer ?? base.explorer,
     hyperSyncUrl: e.hyperSyncUrl ?? e.hypersync_url ?? base.hyperSyncUrl,
@@ -206,11 +223,78 @@ function normalizeHotEntry(e: HotLoadEntry): KuraChainConfig {
   };
 }
 
-export async function loadAllChains(path: string = PATH_CHAINS): Promise<KuraChainConfig[]> {
-  const hot = await loadHotChains(path);
+export function mergeChains(hot: KuraChainConfig[]): KuraChainConfig[] {
   const merged = new Map<number, KuraChainConfig>();
   for (const c of BUNDLED_CHAINS) merged.set(c.id, c);
   for (const c of KNOWN_TESTNETS) merged.set(c.id, c);
   for (const c of hot) merged.set(c.id, c);
   return [...merged.values()];
+}
+
+export async function loadAllChains(path: string = PATH_CHAINS): Promise<KuraChainConfig[]> {
+  return mergeChains(await loadHotChains(path));
+}
+
+export async function reloadHotChains(path: string = PATH_CHAINS): Promise<KuraChainConfig[]> {
+  const hot = await loadHotChains(path);
+  hotCache.clear();
+  for (const c of hot) hotCache.set(c.id, c);
+  return hot;
+}
+
+export function listHotChains(): KuraChainConfig[] {
+  return [...hotCache.values()];
+}
+
+interface ValidateResult {
+  chainId: number;
+}
+
+export async function validateRpc(rpcUrl: string, expectedId?: number): Promise<ValidateResult> {
+  const resp = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!resp.ok) throw new Error(`rpc returned http ${resp.status}`);
+  const json = (await resp.json()) as { result?: string; error?: { message: string } };
+  if (json.error) throw new Error(`rpc error: ${json.error.message}`);
+  if (!json.result) throw new Error("rpc returned no result");
+  const chainId = parseInt(json.result, 16);
+  if (!Number.isFinite(chainId) || chainId <= 0) throw new Error(`bad chain id from rpc: ${json.result}`);
+  if (expectedId !== undefined && chainId !== expectedId) {
+    throw new Error(`chain id mismatch: rpc says ${chainId}, expected ${expectedId}`);
+  }
+  return { chainId };
+}
+
+function escapeToml(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export async function writeHotChains(chains: KuraChainConfig[], path: string = PATH_CHAINS): Promise<void> {
+  const lines: string[] = [];
+  for (const c of chains) {
+    lines.push("[[chains]]");
+    lines.push(`id = ${c.id}`);
+    lines.push(`name = "${escapeToml(c.name)}"`);
+    lines.push(`symbol = "${escapeToml(c.symbol)}"`);
+    lines.push(`tier = ${c.tier}`);
+    if (c.testnet) lines.push("testnet = true");
+    lines.push(`rpcUrl = "${escapeToml(c.rpcUrl)}"`);
+    if (c.explorer) lines.push(`explorer = "${escapeToml(c.explorer)}"`);
+    if (c.hyperSyncUrl) lines.push(`hyperSyncUrl = "${escapeToml(c.hyperSyncUrl)}"`);
+    if (c.alchemyNetwork) lines.push(`alchemyNetwork = "${escapeToml(c.alchemyNetwork)}"`);
+    lines.push("[chains.capabilities]");
+    lines.push(`history = "${c.capabilities.history}"`);
+    lines.push(`simulation = "${c.capabilities.simulation}"`);
+    lines.push(`risk = "${c.capabilities.risk}"`);
+    lines.push(`contractSource = "${c.capabilities.contractSource}"`);
+    lines.push("");
+  }
+  const tmp = `${path}.tmp`;
+  await Bun.write(tmp, lines.join("\n"));
+  await rename(tmp, path);
+  await reloadHotChains(path);
 }

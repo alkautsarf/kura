@@ -1,4 +1,4 @@
-import { decodeFunctionData, formatUnits, parseAbi, type Hex } from "viem";
+import { decodeFunctionData, encodeFunctionData, formatUnits, parseAbi, type Hex } from "viem";
 import type { Address } from "./types.ts";
 import { getKnownChain } from "./chains.ts";
 import { getTokenMeta, getContractLabel, isMaxApproval } from "./token-meta.ts";
@@ -21,6 +21,10 @@ export const COMMON_ABI = parseAbi([
   "function execute(bytes commands, bytes[] inputs, uint256 deadline) payable",
   "function execute(bytes commands, bytes[] inputs) payable",
 ]);
+
+export function encodeErc20Transfer(to: Address, amount: bigint): Hex {
+  return encodeFunctionData({ abi: COMMON_ABI, functionName: "transfer", args: [to, amount] });
+}
 
 export type SemanticKind =
   | "native_send"

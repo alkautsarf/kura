@@ -1,13 +1,21 @@
 import type { Rule } from "./engine.ts";
+import { getKnownChain } from "../chains.ts";
 
 export const ruleSimulationFails: Rule = (ctx) => {
   if (!ctx.simulation) return null;
   if (ctx.simulation.ok) return null;
+  // Chains without Tenderly support (rpc-only) cannot be simulated; surface
+  // that as a "review" hint instead of "danger" so an honest send on a hot
+  // chain doesn't get the scariest badge.
+  const chain = getKnownChain(ctx.chainId);
+  const noSim = chain?.capabilities.simulation === "rpc-only";
   return {
     id: "sim-failed",
-    level: "danger",
-    message: `simulation failed${ctx.simulation.reason ? `: ${ctx.simulation.reason}` : ""}`,
-    detail: { reason: ctx.simulation.reason },
+    level: noSim ? "review" : "danger",
+    message: noSim
+      ? "no simulation available for this chain"
+      : `simulation failed${ctx.simulation.reason ? `: ${ctx.simulation.reason}` : ""}`,
+    detail: { reason: ctx.simulation.reason, noSim },
   };
 };
 

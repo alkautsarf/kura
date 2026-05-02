@@ -136,7 +136,7 @@ export const handleRequestsCreate: JsonHandler = async (req) => {
   if (!body.kind || !body.chainId || !body.source) {
     return badRequest("kind, chainId, source required");
   }
-  if (!getKnownChain(body.chainId) && !(await chainHotloaded(body.chainId))) {
+  if (!getKnownChain(body.chainId)) {
     return badRequest(`unknown chain ${body.chainId}`);
   }
   const pending: PendingRequest = {
@@ -314,11 +314,6 @@ function mapRiskKind(kind: RequestKind, data: `0x${string}`): "send" | "swap" | 
 function sourceToOrigin(source: string): string | undefined {
   if (source.startsWith("shim:")) return source.slice(5);
   return undefined;
-}
-
-async function chainHotloaded(id: number): Promise<boolean> {
-  const all = await loadAllChains();
-  return all.some((c) => c.id === id);
 }
 
 export const handleRequestDecide: JsonHandler = async (req) => {
@@ -573,7 +568,7 @@ export const handleRpcProxy: JsonHandler = async (req, url) => {
   if (!ALLOWED_RPC_METHODS.has(method)) {
     return json({ error: { code: -32601, message: `kura: method ${method} not allowed via /rpc` } });
   }
-  if (!getKnownChain(chainId) && !(await chainHotloaded(chainId))) {
+  if (!getKnownChain(chainId)) {
     return json({ error: { code: -32602, message: `unknown chain ${chainId}` } });
   }
   try {

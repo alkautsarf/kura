@@ -5,7 +5,7 @@ import type { PendingRequest, RiskFinding, RiskLevel, RiskResult, SimulationResu
 import type { SemanticTx } from "../core/decode-tx.ts";
 import { describeTypedData } from "../core/decode-tx.ts";
 import { fmtAddr } from "../cli/format.ts";
-import { getKnownChain } from "../core/chains.ts";
+import { getKnownChain, reloadHotChains } from "../core/chains.ts";
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import { copyToClipboard } from "../core/clipboard.ts";
@@ -223,6 +223,7 @@ function Popup(props: PopupProps) {
     return {
       label: c ? `${c.name} (${cid})` : String(cid),
       symbol: c?.symbol ?? "ETH",
+      noSim: c?.capabilities.simulation === "rpc-only",
     };
   };
 
@@ -240,6 +241,7 @@ function Popup(props: PopupProps) {
       source={source()}
       chainLabel={chainInfo().label}
       chainSymbol={chainInfo().symbol}
+      chainNoSim={chainInfo().noSim}
       fees={fees()}
       typedSummary={typedSummary()}
       calldataScroll={calldataScroll()}
@@ -272,6 +274,7 @@ interface NormalViewProps {
   source: string;
   chainLabel: string;
   chainSymbol: string;
+  chainNoSim: boolean;
   fees: FeeData | null;
   typedSummary: string;
   calldataScroll: number;
@@ -311,6 +314,7 @@ function NormalView(props: NormalViewProps) {
           enriched={props.enriched}
           fees={props.fees}
           chainSymbol={props.chainSymbol}
+          chainNoSim={props.chainNoSim}
         />
       </Show>
       <Show when={props.view === "calldata"}>
@@ -382,6 +386,7 @@ function OutcomeView(props: {
   enriched: boolean;
   fees: FeeData | null;
   chainSymbol: string;
+  chainNoSim: boolean;
 }) {
   const isConnect = props.kind === "connect";
   const isSign = props.kind === "personal_sign" || props.kind === "eth_signTypedData_v4";
@@ -399,7 +404,7 @@ function OutcomeView(props: {
         <BatchOutcome payload={props.payload} />
       </Show>
       <Show when={isTx}>
-        <TxOutcome semantic={props.semantic} sim={props.sim} payload={props.payload} enriched={props.enriched} fees={props.fees} chainSymbol={props.chainSymbol} />
+        <TxOutcome semantic={props.semantic} sim={props.sim} payload={props.payload} enriched={props.enriched} fees={props.fees} chainSymbol={props.chainSymbol} chainNoSim={props.chainNoSim} />
       </Show>
     </box>
   );
@@ -479,6 +484,7 @@ function TxOutcome(props: {
   enriched: boolean;
   fees: FeeData | null;
   chainSymbol: string;
+  chainNoSim: boolean;
 }) {
   return (
     <box flexDirection="column">
@@ -544,7 +550,7 @@ function TxOutcome(props: {
         </Show>
       </Show>
 
-      <BalanceBox sim={props.sim} semantic={props.semantic} payload={props.payload} enriched={props.enriched} />
+      <BalanceBox sim={props.sim} semantic={props.semantic} payload={props.payload} enriched={props.enriched} chainNoSim={props.chainNoSim} />
 
       <Show when={props.sim?.gasUsed}>
         <GasLine gasUsed={props.sim!.gasUsed!} fees={props.fees} chainSymbol={props.chainSymbol} />
@@ -601,6 +607,7 @@ function BalanceBox(props: {
   semantic: SemanticTx | undefined;
   payload: Record<string, unknown>;
   enriched: boolean;
+  chainNoSim: boolean;
 }) {
   const diffs = () => props.sim?.diffs ?? [];
   const outDiffs = () => diffs().filter((d) => d.delta.startsWith("-"));
@@ -616,7 +623,14 @@ function BalanceBox(props: {
             when={props.sim}
             fallback={<text fg={COLORS.dim}>  simulating...</text>}
           >
-            <Show when={props.sim!.ok} fallback={<text fg={COLORS.bad}>  simulation failed: {props.sim!.reason}</text>}>
+            <Show
+              when={props.sim!.ok}
+              fallback={
+                <text fg={COLORS.dim}>
+                  {props.chainNoSim ? "  no simulation available for this chain" : `  simulation failed: ${props.sim!.reason}`}
+                </text>
+              }
+            >
               <NoDiffsMessage semantic={props.semantic} />
             </Show>
           </Show>
@@ -792,6 +806,7 @@ export async function run(args: string[]): Promise<void> {
     console.error("usage: kura popup <id>");
     process.exit(1);
   }
+  await reloadHotChains();
   const cfg = await getConfig();
   const secret = await getOrCreateSecret();
   const base = `https://${cfg.daemonHost}:${cfg.daemonPort}`;

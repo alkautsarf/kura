@@ -5,6 +5,7 @@ import { getConfig, getWallet } from "../../core/config.ts";
 import { priceBySymbol, priceByAddress } from "../../core/prices.ts";
 import { tokenBalances } from "../../core/balance.ts";
 import { parseUnits } from "viem";
+import { encodeErc20Transfer } from "../../core/decode-tx.ts";
 import type { Address } from "../../core/types.ts";
 
 export async function run(positional: string[], args: { chain?: string | number; wallet?: string; note?: string }): Promise<void> {
@@ -59,9 +60,7 @@ export async function run(positional: string[], args: { chain?: string | number;
   console.log(`${COLOR.bold}sending ${rawAmount} ${tokenSym} to ${resolved.address}${COLOR.reset}`);
   console.log(`${COLOR.dim}wallet ${walletName} on chain ${chainId}${COLOR.reset}`);
 
-  const data = isNative
-    ? "0x"
-    : (`0xa9059cbb${resolved.address.slice(2).padStart(64, "0")}${amount.toString(16).padStart(64, "0")}`);
+  const data = isNative ? "0x" : encodeErc20Transfer(resolved.address as Address, amount);
   const payload = {
     from: wallet.address,
     to: isNative ? resolved.address : (tokenAddr as Address),

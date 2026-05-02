@@ -43,6 +43,7 @@ kura connections      # list active dapp sessions
 kura audit -n 20      # off-chain event log
 kura watch            # live SSE stream of daemon events
 kura wallet list      # manage wallets (also: add | use | remove | show | migrate)
+kura chain list       # manage chains (also: add <id> <rpc> | remove | show)
 kura install-shim     # (re)install the qutebrowser userscript
 ```
 
@@ -52,7 +53,7 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 ## TUI keys (home view)
 
-`j`/`k` move cursor on activity rows · `enter` open tx detail · `y` copy wallet address · `s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
+`j`/`k` move cursor on activity rows · `enter` open tx detail · `y` copy wallet address · `s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `N` networks · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
 
 In the tx detail view: `c` copies the hash · `o` opens the explorer · `esc` returns.
 
@@ -75,7 +76,7 @@ In the tx detail view: `c` copies the hash · `o` opens the explorer · `esc` re
 Mainnet (tier 1, full risk + sim): Ethereum, Base, Arbitrum, BSC, Monad.
 Testnet (tier 2, minimal risk engine): Sepolia, Monad Testnet.
 
-Toggle mainnet/testnet with `n` in the TUI. Hot-load any other chain via `~/.kura/chains.toml`.
+Toggle mainnet/testnet with `n` in the TUI. Add any other EVM chain via the TUI Networks view (`Shift+N` → `a`) or the CLI: `kura chain add <id> <rpc>`. The RPC is validated by calling `eth_chainId`; metadata (name, symbol, explorer, testnet flag) is prompted, then the entry is written to `~/.kura/chains.toml` and reloaded across daemon, TUI, CLI, and popup. Hot chains default to RPC-only capabilities (no HyperSync archive, no Tenderly simulation, no GoPlus risk); native sends and the audit-log activity fallback work out of the box, but inbound transfers and predicted-balance diffs require those services per chain.
 
 ## Configuration
 

@@ -1,6 +1,8 @@
 import { start } from "./server.ts";
+import { reloadHotChains } from "../core/chains.ts";
 
 export async function run(): Promise<void> {
+  await reloadHotChains();
   const handle = await start();
   console.log(`kura daemon listening on ${handle.scheme}://${handle.host}:${handle.port}`);
   if (handle.proxy) {

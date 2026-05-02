@@ -7,6 +7,7 @@ import { fmtCompact } from "./format-amount.ts";
 import { getSpamContracts } from "./balance.ts";
 import { priceByAddressBatch } from "./prices.ts";
 import { getClient } from "./rpc.ts";
+import { readAudit } from "./audit-log.ts";
 
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
@@ -83,7 +84,12 @@ export interface HistoryQuery {
 export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
   const chain = getKnownChain(q.chainId);
   if (!chain?.hyperSyncUrl) {
-    throw new Error(`HyperSync URL not configured for chain ${q.chainId}`);
+    // Hot/RPC-only chains have no archive index. Fall back to reading kura's
+    // own audit log of tx we signed, then enriching each via eth_getTransaction*.
+    // Only outbound txs show up (we don't see inbound transfers without an
+    // indexer); the alternative is "no recent activity" forever, which hides
+    // the user's own sends.
+    return fetchActivityFromAudit(q);
   }
   const token = await getToken();
   const limit = q.limit ?? 25;
@@ -236,7 +242,75 @@ export async function fetchActivity(q: HistoryQuery): Promise<ActivityItem[]> {
   // sees one consolidated "Swap X for Y on Router" line instead of contract +
   // N transfer logs. Runs AFTER enrichItems so contract rows already have
   // their semantic baseline; we just upgrade the description with real diffs.
-  return groupAndEnrich(q.chainId, sliced, me);
+  const grouped = await groupAndEnrich(q.chainId, sliced, me);
+  // Address-poisoning pass: an attacker grinds a vanity address whose first
+  // and/or last 6 hex chars match a recent recipient of OURS, then sends a
+  // tiny inbound (1 wei native or 0 USDC) so the spoofed address pollutes
+  // history. Next time the user copy-pastes from history they pick the wrong
+  // address. Mark these as dust so the home view hides them.
+  return markPoisonAttempts(grouped);
+}
+
+function isSmallInbound(it: ActivityItem): boolean {
+  try {
+    const v = BigInt(it.value);
+    if (v === 0n) return true;
+    if (it.kind === "native") return v < 100_000_000_000_000n; // < 0.0001 ETH
+    if (it.kind === "erc20") {
+      const dec = it.decimals ?? 18;
+      // 0.01 token units cap. 0.01 USDC = 10_000 (6dec); 0.01 USDT = 10_000 (6dec).
+      const threshold = 10n ** BigInt(Math.max(0, dec - 2));
+      return v < threshold;
+    }
+  } catch { /* fall through */ }
+  return false;
+}
+
+function similarToAny(addr: string, refs: Set<string>): { hit: boolean; chars: number } {
+  if (!addr) return { hit: false, chars: 0 };
+  const lower = addr.toLowerCase();
+  if (refs.has(lower)) return { hit: false, chars: 0 };
+  const head = lower.slice(2);
+  const tail = lower.slice(-8);
+  let bestChars = 0;
+  for (const ref of refs) {
+    const rh = ref.slice(2);
+    const rt = ref.slice(-8);
+    let h = 0;
+    while (h < head.length && h < rh.length && head[h] === rh[h]) h++;
+    let t = 0;
+    while (t < tail.length && t < rt.length && tail[tail.length - 1 - t] === rt[rt.length - 1 - t]) t++;
+    bestChars = Math.max(bestChars, h, t);
+  }
+  return { hit: bestChars >= 3, chars: bestChars };
+}
+
+function markPoisonAttempts(items: ActivityItem[]): ActivityItem[] {
+  const recipients = new Set<string>();
+  for (const it of items) {
+    if (it.direction === "out" && it.to) recipients.add(it.to.toLowerCase());
+  }
+  const hasRecentSends = recipients.size > 0;
+  for (const it of items) {
+    if (it.isDust) continue;
+    if (it.direction !== "in") continue;
+    if (!isSmallInbound(it)) continue;
+    if (!it.from) continue;
+    // Two ways to flag as poison:
+    //  1. Sender address shares 3+ leading or trailing hex chars with one of our
+    //     recent outbound recipients (vanity-grind poisoning).
+    //  2. Tiny inbound that arrives while we're actively sending (blind dust
+    //     spray that polluters fan out to anyone with recent activity).
+    const sim = similarToAny(it.from, recipients);
+    if (sim.hit) {
+      it.isDust = true;
+      it.description = `${it.description ?? ""} [poison ${sim.chars}-char match]`.trim();
+    } else if (hasRecentSends) {
+      it.isDust = true;
+      it.description = `${it.description ?? ""} [dust spray]`.trim();
+    }
+  }
+  return items;
 }
 
 async function enrichItems(chainId: number, items: ActivityItem[], txs: RawTx[]): Promise<void> {
@@ -497,4 +571,67 @@ async function groupAndEnrich(chainId: number, items: ActivityItem[], me: string
     }
   }));
   return dropped.size === 0 ? items : items.filter((it) => !dropped.has(it));
+}
+
+interface AuditTxPayload {
+  chainId?: number;
+  walletName?: string;
+  txHash?: string;
+  to?: string;
+}
+
+// RPC fallback for chains without HyperSync. Reads kura's audit log for
+// tx_signed events on this chain, then enriches each via eth_getTransactionByHash
+// + eth_getBlockByNumber to fill in value, blockNumber, timestamp.
+// Inbound txs aren't visible (audit only records sends we made), but the user's
+// own activity beats "no recent activity" forever.
+async function fetchActivityFromAudit(q: HistoryQuery): Promise<ActivityItem[]> {
+  const limit = q.limit ?? 25;
+  const events = await readAudit({ type: "tx_signed" });
+  const myAddr = q.address.toLowerCase();
+  const matching = events
+    .filter((e) => (e.payload as AuditTxPayload).chainId === q.chainId)
+    .reverse()
+    .slice(0, limit * 2);
+  if (matching.length === 0) return [];
+
+  const client = await getClient(q.chainId);
+  const txs = await Promise.all(
+    matching.map(async (e) => {
+      const p = e.payload as AuditTxPayload;
+      if (!p.txHash) return null;
+      try {
+        const tx = await client.getTransaction({ hash: p.txHash as Hex });
+        if (!tx || tx.from.toLowerCase() !== myAddr) return null;
+        return { tx, ts: new Date(e.ts).getTime() };
+      } catch { return null; }
+    }),
+  );
+  // One getBlock per unique blockNumber (multiple txs in same block share it).
+  const blockNums = new Set<bigint>();
+  for (const t of txs) if (t?.tx.blockNumber) blockNums.add(t.tx.blockNumber);
+  const blockMap = new Map<bigint, number>();
+  await Promise.all([...blockNums].map(async (bn) => {
+    const block = await client.getBlock({ blockNumber: bn }).catch(() => null);
+    if (block?.timestamp) blockMap.set(bn, Number(block.timestamp) * 1000);
+  }));
+  const items: ActivityItem[] = [];
+  for (const t of txs) {
+    if (!t) continue;
+    const { tx, ts } = t;
+    const valueStr = tx.value.toString();
+    const isErc20 = tx.input && tx.input.length >= 10 && tx.input.toLowerCase().startsWith("0xa9059cbb");
+    items.push({
+      hash: tx.hash as Hex,
+      blockNumber: tx.blockNumber ? Number(tx.blockNumber) : 0,
+      timestamp: tx.blockNumber ? blockMap.get(tx.blockNumber) ?? ts : ts,
+      from: tx.from as Address,
+      to: (tx.to ?? null) as Address | null,
+      value: valueStr,
+      direction: "out",
+      kind: isErc20 ? "erc20" : (valueStr === "0" ? "contract" : "native"),
+    });
+  }
+  items.sort((a, b) => b.blockNumber - a.blockNumber);
+  return items.slice(0, limit);
 }

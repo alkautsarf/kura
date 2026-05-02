@@ -25,6 +25,7 @@ export interface AuditQuery {
   rejected?: boolean;
   since?: number;
   limit?: number;
+  type?: string;
 }
 
 export async function readAudit(query: AuditQuery = {}, path: string = PATH_AUDIT): Promise<AuditEvent[]> {
@@ -33,12 +34,14 @@ export async function readAudit(query: AuditQuery = {}, path: string = PATH_AUDI
   const out: AuditEvent[] = [];
   for (const raw of text.split("\n")) {
     if (!raw) continue;
+    if (query.type && !raw.includes(`"type":"${query.type}"`)) continue;
     let ev: AuditEvent;
     try {
       ev = JSON.parse(raw) as AuditEvent;
     } catch {
       continue;
     }
+    if (query.type && ev.type !== query.type) continue;
     if (query.source && ev.payload.source !== query.source) continue;
     if (query.rejected && ev.payload.decision !== "reject") continue;
     if (query.since && new Date(ev.ts).getTime() < query.since) continue;

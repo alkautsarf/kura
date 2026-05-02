@@ -12,8 +12,9 @@ import { copyToClipboard } from "../core/clipboard.ts";
 import { getConfig, getWallet, isBiometryMigrated, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
-import { getKnownChain } from "../core/chains.ts";
+import { getKnownChain, reloadHotChains, validateRpc, writeHotChains, listHotChains, getBundledChain, mergeChains, DEFAULT_HOT_CAPABILITIES } from "../core/chains.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
+import { encodeErc20Transfer } from "../core/decode-tx.ts";
 import { attachRestoreHandlers, disableTerminalNotifications, quit, setActiveRenderer } from "../core/terminal.ts";
 import {
   createGeneratedWallet,
@@ -117,7 +118,12 @@ function fmtUsd(n: number | undefined): string {
 function fmtTok(raw: string, decimals: number): string {
   const n = Number(formatUnits(BigInt(raw), decimals));
   if (Math.abs(n) >= 1000) return n.toFixed(0);
-  if (Math.abs(n) >= 1) return n.toFixed(2);
+  if (Math.abs(n) >= 1) {
+    // Show 4 decimals so small sends (0.001 OG, gas costs) are visible.
+    // Trim trailing zeros for clean output: 5.0000 -> 5, 4.9989 stays.
+    return n.toFixed(4).replace(/\.?0+$/, "");
+  }
+  if (Math.abs(n) >= 1e-4) return n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
   return n.toFixed(4);
 }
 
@@ -270,7 +276,7 @@ async function reverseLookup(addr: string): Promise<string | null> {
   return null;
 }
 
-type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets" | "tx";
+type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets" | "chains" | "tx";
 
 interface AppProps {
   wallet: WalletProfile;
@@ -361,9 +367,10 @@ function App(props: AppProps) {
   });
   onCleanup(() => sseCtrl?.abort());
 
+  const [chainsTick, setChainsTick] = createSignal(0);
   const [chainList] = createResource(
-    () => mode(),
-    async (m) => {
+    () => [mode(), chainsTick()] as const,
+    async ([m]) => {
       const r = await get<{ chains: KuraChainConfig[] }>(`/chains?mode=${m}`).catch(() => ({ chains: [] }));
       return r.chains;
     },
@@ -528,6 +535,7 @@ function App(props: AppProps) {
       else if (key.name === "e") setView("watch");
       else if (key.name === "g") setTick((t) => t + 1);
       else if (key.name === "u") setShowUnverified((v) => !v);
+      else if (key.name === "n" && key.shift) setView("chains");
       else if (key.name === "n") void toggleMode();
       else if (key.name === "j" || key.name === "down") moveCursor(1);
       else if (key.name === "k" || key.name === "up") moveCursor(-1);
@@ -575,6 +583,7 @@ function App(props: AppProps) {
     // Non-home views: only Esc returns home. Lets text input handlers see all other keys.
     // wallets owns its escape so sub-modes (name input, add-choose, etc) can pop one level.
     if (view() === "wallets") return;
+    if (view() === "chains") return;
     if (key.name === "escape") {
       setView("home");
     }
@@ -620,7 +629,7 @@ function App(props: AppProps) {
         />
       </Show>
       <Show when={view() === "send"}>
-        <SendModal wallet={wallet()} chainId={chainId()} chain={chain()} onDone={() => setView("home")} />
+        <SendModal wallet={wallet()} chainId={chainId()} chain={chain()} portfolio={portfolio()} onDone={() => setView("home")} />
       </Show>
       <Show when={view() === "receive"}>
         <ReceiveModal wallet={wallet()} chain={chain()} />
@@ -653,6 +662,24 @@ function App(props: AppProps) {
           onListChange={(list) => setWallets(list)}
           onClose={() => setView("home")}
           renderer={renderer}
+        />
+      </Show>
+      <Show when={view() === "chains"}>
+        <ChainView
+          mode={mode()}
+          currentChainId={chainId()}
+          onSelect={async (c) => {
+            const wantMode: NetworkMode = c.testnet ? "testnet" : "mainnet";
+            if (mode() !== wantMode) {
+              await toggleMode();
+              // Wait for chainList resource to refetch so the createEffect
+              // doesn't snap chainId back to the new mode's first entry.
+              await new Promise((r) => setTimeout(r, 250));
+            }
+            setChainId(c.id);
+          }}
+          onChange={() => setChainsTick((t) => t + 1)}
+          onClose={() => setView("home")}
         />
       </Show>
 
@@ -855,6 +882,7 @@ function SendModal(props: {
   wallet: WalletProfile;
   chainId: number;
   chain: KuraChainConfig | undefined;
+  portfolio: Portfolio | null | undefined;
   onDone: () => void;
 }) {
   const [field, setField] = createSignal<"to" | "amount" | "token" | "submit">("none" as never);
@@ -910,16 +938,54 @@ function SendModal(props: {
       const resolved = await resolveName(toRaw);
       const dest = resolved.address;
       if (!dest) throw new Error(`could not resolve ${to()}`);
-      const isNative = token().toUpperCase() === (props.chain?.symbol ?? "ETH").toUpperCase();
+      const symbol = token().toUpperCase();
+      const isNative = symbol === (props.chain?.symbol ?? "ETH").toUpperCase();
       let value = "0";
-      let dataField = "0x";
+      let dataField: `0x${string}` = "0x";
       let target: Address = dest;
+      const rawAmount = amount().trim();
       if (isNative) {
-        value = parseUnits(amount().replace(/^\$/, ""), 18).toString();
+        value = parseUnits(rawAmount.replace(/^\$/, ""), 18).toString();
       } else {
-        setStatus("token sends from TUI not yet wired to balance lookup; use CLI");
-        setBusy(false);
-        return;
+        const tokens = props.portfolio?.tokens ?? [];
+        const tok = tokens.find(
+          (t) => t.token !== "native" && t.symbol.toUpperCase() === symbol,
+        );
+        if (!tok) {
+          setStatus(`no ${symbol} balance on this chain`);
+          setBusy(false);
+          return;
+        }
+        const tokenAddr = tok.token as Address;
+        const dec = tok.decimals;
+        let amt: bigint;
+        if (rawAmount.startsWith("$")) {
+          const usd = Number(rawAmount.slice(1));
+          if (!Number.isFinite(usd) || usd <= 0) {
+            setStatus("bad $ amount");
+            setBusy(false);
+            return;
+          }
+          const balDec = Number(formatUnits(BigInt(tok.balance), dec));
+          const unitPrice = balDec > 0 && tok.usd ? tok.usd / balDec : null;
+          if (!unitPrice) {
+            setStatus(`no price for ${symbol}, can't convert $`);
+            setBusy(false);
+            return;
+          }
+          amt = parseUnits((usd / unitPrice).toFixed(dec), dec);
+        } else {
+          try {
+            amt = parseUnits(rawAmount, dec);
+          } catch {
+            setStatus(`bad amount: ${rawAmount}`);
+            setBusy(false);
+            return;
+          }
+        }
+        target = tokenAddr;
+        value = "0";
+        dataField = encodeErc20Transfer(dest, amt);
       }
       setStatus("submitting to daemon...");
       const result = await post<{ decision: string; txHash?: string; error?: string }>("/requests", {
@@ -1937,11 +2003,324 @@ function WalletView(props: {
   );
 }
 
+type ChainMode = "list" | "add-id" | "add-rpc" | "add-meta" | "confirm-remove";
+type AddMetaField = "name" | "symbol" | "explorer" | "testnet" | "submit";
+
+function ChainView(props: {
+  mode: NetworkMode;
+  currentChainId: number;
+  onSelect: (chain: KuraChainConfig) => void;
+  onChange: () => void;
+  onClose: () => void;
+}) {
+  const [rows, setRows] = createSignal<KuraChainConfig[]>([]);
+  const [hotIds, setHotIds] = createSignal<Set<number>>(new Set());
+  const [selected, setSelected] = createSignal(0);
+  const [view, setViewMode] = createSignal<ChainMode>("list");
+  const [busy, setBusy] = createSignal(false);
+  const [status, setStatus] = createSignal("");
+
+  const [idInput, setIdInput] = createSignal("");
+  const [rpcInput, setRpcInput] = createSignal("");
+  const [pendingId, setPendingId] = createSignal(0);
+  const [pendingRpc, setPendingRpc] = createSignal("");
+
+  const [nameInput, setNameInput] = createSignal("");
+  const [symbolInput, setSymbolInput] = createSignal("ETH");
+  const [explorerInput, setExplorerInput] = createSignal("");
+  const [isTestnet, setIsTestnet] = createSignal(false);
+  const [metaField, setMetaField] = createSignal<AddMetaField>("name");
+
+  const [inputReady, setInputReady] = createSignal(false);
+  const [mountKey, setMountKey] = createSignal(0);
+  const armTimers: ReturnType<typeof setTimeout>[] = [];
+
+  function armInput(): void {
+    for (const t of armTimers) clearTimeout(t);
+    armTimers.length = 0;
+    setInputReady(false);
+    armTimers.push(setTimeout(() => {
+      setInputReady(true);
+      armTimers.push(setTimeout(() => {
+        setInputReady(false);
+        setIdInput("");
+        setRpcInput("");
+        armTimers.push(setTimeout(() => {
+          setMountKey((k) => k + 1);
+          setInputReady(true);
+        }, 30));
+      }, 100));
+    }, 150));
+  }
+
+  async function reload(): Promise<KuraChainConfig[]> {
+    const hot = await reloadHotChains();
+    const all = mergeChains(hot);
+    setRows(all.sort((a, b) => a.id - b.id));
+    setHotIds(new Set(hot.map((c) => c.id)));
+    return all;
+  }
+
+  onMount(() => {
+    void reload().then((all) => {
+      const idx = all.findIndex((c) => c.id === props.currentChainId);
+      setSelected(idx >= 0 ? idx : 0);
+    });
+  });
+  onCleanup(() => { for (const t of armTimers) clearTimeout(t); });
+
+  function startAdd(): void {
+    setStatus("");
+    setIdInput("");
+    setRpcInput("");
+    setPendingId(0);
+    setPendingRpc("");
+    armInput();
+    setViewMode("add-id");
+  }
+
+  async function commitId(): Promise<void> {
+    const idStr = idInput().trim();
+    const id = Number(idStr);
+    if (!Number.isFinite(id) || id <= 0) {
+      setStatus("bad chain id");
+      return;
+    }
+    if (getBundledChain(id)) {
+      setStatus(`${id} is bundled (cannot override)`);
+      return;
+    }
+    setPendingId(id);
+    setStatus("");
+    armInput();
+    setViewMode("add-rpc");
+  }
+
+  async function commitRpc(): Promise<void> {
+    const rpc = rpcInput().trim();
+    if (!rpc.startsWith("http")) {
+      setStatus("bad rpc url");
+      return;
+    }
+    setBusy(true);
+    setStatus(`validating ${rpc}...`);
+    try {
+      await validateRpc(rpc, pendingId());
+      setPendingRpc(rpc);
+      setStatus("");
+      setNameInput(`Chain ${pendingId()}`);
+      setSymbolInput("ETH");
+      setExplorerInput("");
+      setIsTestnet(props.mode === "testnet");
+      setMetaField("name");
+      armInput();
+      setViewMode("add-meta");
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function commitAdd(): Promise<void> {
+    const id = pendingId();
+    const name = nameInput().trim() || `Chain ${id}`;
+    const symbol = (symbolInput().trim() || "ETH").toUpperCase();
+    const explorer = explorerInput().trim();
+    const testnet = isTestnet();
+    setBusy(true);
+    setStatus(`writing chains.toml...`);
+    try {
+      const existing = listHotChains().filter((c) => c.id !== id);
+      const chain: KuraChainConfig = {
+        id,
+        name,
+        symbol,
+        tier: 2,
+        testnet: testnet || undefined,
+        rpcUrl: pendingRpc(),
+        explorer,
+        capabilities: { ...DEFAULT_HOT_CAPABILITIES },
+      };
+      await writeHotChains([...existing, chain]);
+      props.onChange();
+      const all = await reload();
+      const idx = all.findIndex((c) => c.id === id);
+      if (idx >= 0) setSelected(idx);
+      setStatus(`added ${name}`);
+      setViewMode("list");
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function performRemove(): Promise<void> {
+    const c = rows()[selected()];
+    if (!c) return;
+    if (!hotIds().has(c.id)) {
+      setStatus("can't remove bundled chain");
+      setViewMode("list");
+      return;
+    }
+    setBusy(true);
+    setStatus(`removing ${c.name}...`);
+    try {
+      const remaining = listHotChains().filter((x) => x.id !== c.id);
+      await writeHotChains(remaining);
+      props.onChange();
+      const all = await reload();
+      setSelected((s) => Math.max(0, Math.min(all.length - 1, s)));
+      setStatus(`removed ${c.name}`);
+    } catch (err) {
+      setStatus(`error: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+      setViewMode("list");
+    }
+  }
+
+  useKeyboard((key) => {
+    if (busy()) return;
+    const v = view();
+    if (v === "list") {
+      if (key.name === "escape") { props.onClose(); return; }
+      const list = rows();
+      if (list.length === 0) {
+        if (key.name === "a") startAdd();
+        return;
+      }
+      if (key.name === "j" || key.name === "down") setSelected((s) => Math.min(list.length - 1, s + 1));
+      else if (key.name === "k" || key.name === "up") setSelected((s) => Math.max(0, s - 1));
+      else if (key.name === "return") {
+        const c = list[selected()];
+        if (c) { props.onSelect(c); setStatus(`selected ${c.name}`); }
+      }
+      else if (key.name === "a") startAdd();
+      else if (key.name === "d") {
+        const c = list[selected()];
+        if (c && hotIds().has(c.id)) setViewMode("confirm-remove");
+        else setStatus("can't remove bundled chain");
+      }
+      return;
+    }
+    if (v === "add-id") {
+      if (key.name === "return") void commitId();
+      else if (key.name === "escape") { setViewMode("list"); setStatus(""); }
+      return;
+    }
+    if (v === "add-rpc") {
+      if (key.name === "return") void commitRpc();
+      else if (key.name === "escape") { setViewMode("add-id"); setStatus(""); armInput(); }
+      return;
+    }
+    if (v === "add-meta") {
+      const order: AddMetaField[] = ["name", "symbol", "explorer", "testnet", "submit"];
+      if (key.name === "tab") {
+        const idx = order.indexOf(metaField());
+        setMetaField(order[(idx + 1) % order.length]!);
+      } else if (key.name === "return") {
+        if (metaField() === "submit") void commitAdd();
+        else {
+          const idx = order.indexOf(metaField());
+          setMetaField(order[Math.min(order.length - 1, idx + 1)]!);
+        }
+      } else if (key.name === "escape") {
+        setViewMode("add-rpc"); setStatus(""); armInput();
+      } else if (metaField() === "testnet" && (key.name === "y" || key.name === "n")) {
+        setIsTestnet(key.name === "y");
+      }
+      return;
+    }
+    if (v === "confirm-remove") {
+      if (key.name === "y") void performRemove();
+      else if (key.name === "n" || key.name === "escape") { setViewMode("list"); setStatus(""); }
+      return;
+    }
+  });
+
+  return (
+    <box marginTop={1} flexDirection="column">
+      <text attributes={1}>networks</text>
+      <Show when={view() === "list"}>
+        <Show
+          when={rows().length > 0}
+          fallback={<text fg="#666">  no chains configured. press [a] to add.</text>}
+        >
+          <For each={rows()}>
+            {(c, idx) => {
+              const tnet = c.testnet ? " · testnet" : "";
+              return (
+                <text fg={idx() === selected() ? "#3ddc84" : undefined}>
+                  {`  ${idx() === selected() ? ">" : " "} ${c.id === props.currentChainId ? "*" : " "} ${String(c.id).padEnd(6)} ${c.name.padEnd(20)} ${c.symbol.padEnd(5)} ${hotIds().has(c.id) ? "hot" : "bundled"}${tnet}`}
+                </text>
+              );
+            }}
+          </For>
+        </Show>
+        <text fg="#888" marginTop={1}>{`  j/k move  enter select  a add  d remove (hot only)  esc back`}</text>
+      </Show>
+      <Show when={view() === "add-id"}>
+        <box marginTop={1} flexDirection="column">
+          <text>  new network: chain id</text>
+          <FormRow
+            label="id"
+            value={idInput()}
+            active={true}
+            ready={inputReady()}
+            onChange={setIdInput}
+            mountKey={mountKey()}
+            hint="numeric, e.g. 16602"
+          />
+          <text fg="#888" marginTop={1}>{`  enter to continue, esc to cancel`}</text>
+        </box>
+      </Show>
+      <Show when={view() === "add-rpc"}>
+        <box marginTop={1} flexDirection="column">
+          <text>{`  chain ${pendingId()}: rpc url`}</text>
+          <FormRow
+            label="rpc"
+            value={rpcInput()}
+            active={true}
+            ready={inputReady()}
+            onChange={setRpcInput}
+            mountKey={mountKey()}
+            hint="https://..."
+          />
+          <text fg="#888" marginTop={1}>{`  enter validates by calling eth_chainId, esc back`}</text>
+        </box>
+      </Show>
+      <Show when={view() === "add-meta"}>
+        <box marginTop={1} flexDirection="column">
+          <text>{`  chain ${pendingId()} metadata`}</text>
+          <FormRow label="name" value={nameInput()} active={metaField() === "name"} ready={inputReady()} onChange={setNameInput} mountKey={mountKey()} hint="display name" />
+          <FormRow label="symbol" value={symbolInput()} active={metaField() === "symbol"} ready={inputReady()} onChange={setSymbolInput} mountKey={mountKey()} hint="native token symbol" />
+          <FormRow label="explorer" value={explorerInput()} active={metaField() === "explorer"} ready={inputReady()} onChange={setExplorerInput} mountKey={mountKey()} hint="https://... (optional)" />
+          <box flexDirection="row" marginTop={1}>
+            <text fg={metaField() === "testnet" ? "#3ddc84" : "#888"}>{`  testnet  `}</text>
+            <text>{isTestnet() ? "yes" : "no"}</text>
+            <text fg="#666">{`   (y/n while focused)`}</text>
+          </box>
+          <text fg={metaField() === "submit" ? "#3ddc84" : "#888"}>{`  [submit]  ${metaField() === "submit" ? "<- press Enter" : ""}`}</text>
+          <text fg="#888" marginTop={1}>{`  tab cycles  enter advances/submits  esc back`}</text>
+        </box>
+      </Show>
+      <Show when={view() === "confirm-remove"}>
+        <box marginTop={1} flexDirection="column">
+          <text fg="#ff8c66">{`  remove ${rows()[selected()]?.name ?? "?"}? [y/n]`}</text>
+        </box>
+      </Show>
+      <text fg={status() ? "#ffc857" : "#666"} marginTop={1}>{status()}</text>
+    </box>
+  );
+}
+
 function FooterHints(props: { view: View; mode?: "overview" | "data" }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[j/k] move  [enter] detail  [y] copy addr  [s] send  [r] receive  [h] history  [c] connections  [w] wallets  [e] watch  [tab] chain  [shift+tab] wallet  [n] mode  [u] unverified  [g] refresh  [q] quit";
+        return "[j/k] move  [enter] detail  [y] copy addr  [s] send  [r] receive  [h] history  [c] connections  [w] wallets  [N] networks  [e] watch  [tab] chain  [shift+tab] wallet  [n] mode  [u] unverified  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
@@ -1954,6 +2333,8 @@ function FooterHints(props: { view: View; mode?: "overview" | "data" }) {
         return "esc back";
       case "wallets":
         return "j/k move  enter set default  a add  d remove  D remove+purge  esc back";
+      case "chains":
+        return "j/k move  enter select  a add  d remove (hot only)  esc back";
       case "tx":
         return props.mode === "data"
           ? "[j/k] scroll  [c] copy bytes  [o] open explorer  [tab] back to overview  [esc] back"
@@ -1976,6 +2357,7 @@ export async function run(): Promise<void> {
     await runInit({});
     return;
   }
+  await reloadHotChains();
   const cfg = await getConfig();
   const all = await listWallets();
   if (all.length === 0) {

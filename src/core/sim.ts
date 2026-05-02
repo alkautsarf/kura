@@ -2,6 +2,7 @@ import type { BalanceDiff, SimulationResult, Address } from "./types.ts";
 import { readTenderlyKey } from "./keychain.ts";
 import { withTimeout } from "./promise.ts";
 import { getTokenMeta } from "./token-meta.ts";
+import { getKnownChain } from "./chains.ts";
 
 export interface SimInput {
   chainId: number;
@@ -36,6 +37,13 @@ async function loadCreds(cfg: SimConfig = {}): Promise<typeof creds> {
 }
 
 export async function simulate(input: SimInput, cfg: SimConfig = {}): Promise<SimulationResult> {
+  // Hot chains and bundled chains without Tenderly support skip the call
+  // entirely. Without this, every send on a non-Tenderly chain pays the full
+  // 15s + 8s timeout cycle and the popup hangs on "simulating...".
+  const chain = getKnownChain(input.chainId);
+  if (chain && chain.capabilities.simulation !== "tenderly") {
+    return { ok: false, reason: "no simulation available for this chain", diffs: [] };
+  }
   const c = await loadCreds(cfg);
   if (!c) {
     return {
