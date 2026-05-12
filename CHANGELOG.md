@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-05-12
+
+### Fixed
+- Popup orphan accumulation when a dapp fires two requests back-to-back (e.g. SIWE: connect approval immediately followed by `personal_sign`). `tmux display-popup -E` is single-slot per attached client: a second invocation while one popup is open returns exit 0 but silently drops the inner shell command, so the daemon's queue entry would persist forever and the dapp's HTTP request would hang until anima's 60s timeout fired and re-fired SIWE, multiplying the orphans. `daemon/requests.ts` now serializes spawns via a `currentPopupId` slot + `drainQueue()` so the second popup waits for the first to finish, and a new `onPopupExited()` handler auto-rejects any entry whose popup process exited without posting `/decision` (crash, SIGKILL, terminal close, tmux drop) so the queue self-cleans.
+
 ## [0.1.21] - 2026-05-12
 
 ### Added
@@ -36,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encodeErc20Transfer(to, amount)` extracted to `core/decode-tx.ts`; CLI and TUI now share one ERC20 transfer encoder.
 - `DEFAULT_HOT_CAPABILITIES` constant + `mergeChains(hot)` helper added to `core/chains.ts` so CLI and TUI add flows can't drift on capability defaults.
 
+[0.1.22]: https://github.com/alkautsarf/kura/releases/tag/v0.1.22
 [0.1.21]: https://github.com/alkautsarf/kura/releases/tag/v0.1.21
 [0.1.20]: https://github.com/alkautsarf/kura/releases/tag/v0.1.20
 

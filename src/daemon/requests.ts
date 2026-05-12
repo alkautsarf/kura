@@ -32,6 +32,26 @@ export interface PendingEntry {
 
 const queue = new Map<string, PendingEntry>();
 
+// tmux display-popup is single-slot per attached client: a second invocation
+// while one popup is open returns exit 0 but silently drops the inner shell
+// command. Serialize spawns ourselves so anima-style rapid-fire flows (connect
+// then personal_sign in the same tick) don't lose their second popup.
+let currentPopupId: string | null = null;
+
+function drainQueue(): void {
+  if (currentPopupId !== null) return;
+  const next = [...queue.values()].find((e) => !e.resolved);
+  if (!next) return;
+  currentPopupId = next.request.id;
+  spawnPopup(next.request.id).catch((err) => {
+    if (currentPopupId === next.request.id) currentPopupId = null;
+    if (!next.resolved) {
+      next.resolver({ decision: "reject", error: `popup spawn failed: ${err.message}` });
+    }
+    drainQueue();
+  });
+}
+
 export function enqueue(
   request: PendingRequest,
   meta: { simulation?: SimulationResult; risk?: RiskResult; semantic?: SemanticTx } = {},
@@ -61,9 +81,10 @@ export function enqueue(
     };
     queue.set(request.id, entry);
     emit("request:pending", { id: request.id, kind: request.kind, source: request.source });
-    spawnPopup(request.id).catch((err) => {
-      entry.resolver({ decision: "reject", error: `popup spawn failed: ${err.message}` });
-    });
+    // drainQueue spawns immediately if no popup is currently rendering, else
+    // leaves the entry queued. proc.exited drains the next one when the
+    // current popup's tmux process fully exits (not when /decision lands).
+    drainQueue();
   });
 }
 
@@ -126,12 +147,14 @@ async function spawnPopup(id: string): Promise<void> {
       stdout: "pipe",
       stderr: "pipe",
     });
-    proc.exited.then(async (code) => {
+    proc.exited.then((code) => {
       if (code !== 0) {
-        const err = await new Response(proc.stderr).text();
-        console.warn(`[daemon] popup-pane spawn failed (${targetPane}) code=${code}: ${err.slice(0, 200)}`);
+        new Response(proc.stderr).text()
+          .then((err) => console.warn(`[daemon] popup-pane spawn failed (${targetPane}) code=${code}: ${err.slice(0, 200)}`))
+          .catch(() => {});
       }
-    }).catch(() => {});
+      onPopupExited(id, code);
+    }).catch(() => onPopupExited(id, -1));
     return;
   }
   // Resolve tmux target. When daemon was started inside tmux (manual launch),
@@ -143,7 +166,11 @@ async function spawnPopup(id: string): Promise<void> {
   if (!process.env.TMUX) {
     const session = await findAttachedTmuxSession();
     if (!session) {
-      console.warn(`[daemon] no tmux server reachable, popup queued only: ${popupCmd}`);
+      // No UI surface to render into. Reject the entry so the dapp's HTTP
+      // request unblocks instead of hanging, then drain so a subsequent
+      // request with a reachable tmux still gets a shot.
+      console.warn(`[daemon] no tmux server reachable, rejecting popup: ${popupCmd}`);
+      onPopupExited(id, -1);
       return;
     }
     extraArgs.push("-t", session);
@@ -159,12 +186,30 @@ async function spawnPopup(id: string): Promise<void> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  proc.exited.then(async (code) => {
+  proc.exited.then((code) => {
     if (code !== 0) {
-      const err = await new Response(proc.stderr).text();
-      console.warn(`[daemon] popup ${id.slice(0, 8)} exit ${code}: ${err.slice(0, 200)} (also see ${logFile})`);
+      new Response(proc.stderr).text()
+        .then((err) => console.warn(`[daemon] popup ${id.slice(0, 8)} exit ${code}: ${err.slice(0, 200)} (also see ${logFile})`))
+        .catch(() => {});
     }
-  }).catch(() => {});
+    onPopupExited(id, code);
+  }).catch(() => onPopupExited(id, -1));
+}
+
+// Auto-reject the entry if the popup died without posting /decision (tmux
+// silent-drop, crash, SIGKILL, terminal close), then advance the queue.
+// Double-resolve is guarded inside resolver, so this is safe if /decision
+// already landed.
+function onPopupExited(id: string, code: number): void {
+  const entry = queue.get(id);
+  if (entry && !entry.resolved) {
+    console.warn(`[daemon] popup ${id.slice(0, 8)} exited without /decision (code ${code}), auto-rejecting`);
+    entry.resolver({ decision: "reject", error: `popup exited without decision (code ${code})` });
+  }
+  if (currentPopupId === id) {
+    currentPopupId = null;
+    drainQueue();
+  }
 }
 
 async function findAttachedTmuxSession(): Promise<string | null> {
