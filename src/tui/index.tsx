@@ -12,6 +12,7 @@ import { copyToClipboard } from "../core/clipboard.ts";
 import { getConfig, getWallet, isBiometryMigrated, listWallets, setDefaultWallet, writeConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
 import type { Address, ActivityItem, KuraChainConfig, NetworkMode, Portfolio, WalletProfile } from "../core/types.ts";
+import type { AllChainsPortfolio } from "../core/portfolio.ts";
 import { getKnownChain, reloadHotChains, validateRpc, writeHotChains, listHotChains, getBundledChain, mergeChains, DEFAULT_HOT_CAPABILITIES } from "../core/chains.ts";
 import { resolve as resolveName } from "../core/resolve.ts";
 import { encodeErc20Transfer } from "../core/decode-tx.ts";
@@ -276,7 +277,7 @@ async function reverseLookup(addr: string): Promise<string | null> {
   return null;
 }
 
-type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets" | "chains" | "tx";
+type View = "home" | "send" | "receive" | "history" | "connections" | "watch" | "wallets" | "chains" | "tx" | "all-chains";
 
 interface AppProps {
   wallet: WalletProfile;
@@ -434,6 +435,7 @@ function App(props: AppProps) {
   // on the daemon side instead of waiting for it to complete and discarding it.
   let portfolioCtrl: AbortController | null = null;
   let historyCtrl: AbortController | null = null;
+  let allPortfolioCtrl: AbortController | null = null;
   const [portfolio] = createResource(
     () => [committedChainId(), tick(), wallet().address] as const,
     async ([cid, _t, addr]) => {
@@ -441,6 +443,23 @@ function App(props: AppProps) {
       portfolioCtrl = new AbortController();
       try {
         return await getSignal<Portfolio>(`/portfolio?chain=${cid}&address=${addr}`, portfolioCtrl.signal);
+      } catch {
+        return null;
+      }
+    },
+  );
+  // Cross-chain aggregate. Gated on view === "all-chains" so the daemon fan-out
+  // (5-10s cold) doesn't fire when the user is on home. The fresh signal lets
+  // [g] inside the view bypass the daemon's 15s cache.
+  const [allPortfolioFresh, setAllPortfolioFresh] = createSignal(0);
+  const [allPortfolio] = createResource(
+    () => (view() === "all-chains" ? [tick(), wallet().address, wallet().name, allPortfolioFresh()] as const : null),
+    async ([_t, addr, name, freshTick]) => {
+      allPortfolioCtrl?.abort();
+      allPortfolioCtrl = new AbortController();
+      try {
+        const qs = `address=${addr}&wallet=${encodeURIComponent(name)}${freshTick > 0 ? "&fresh=1" : ""}`;
+        return await getSignal<AllChainsPortfolio>(`/portfolio/all?${qs}`, allPortfolioCtrl.signal);
       } catch {
         return null;
       }
@@ -462,12 +481,13 @@ function App(props: AppProps) {
   // Only tick when the user can actually see the data , avoids racking up
   // background daemon roundtrips while they're managing wallets or sessions.
   const interval = setInterval(() => {
-    if (view() === "home" || view() === "history") setTick((t) => t + 1);
+    if (view() === "home" || view() === "history" || view() === "all-chains") setTick((t) => t + 1);
   }, 30_000);
   onCleanup(() => {
     clearInterval(interval);
     portfolioCtrl?.abort();
     historyCtrl?.abort();
+    allPortfolioCtrl?.abort();
   });
 
   // Reset cursor when wallet or chain changes (the underlying activity list is
@@ -536,6 +556,7 @@ function App(props: AppProps) {
       else if (key.name === "g") setTick((t) => t + 1);
       else if (key.name === "u") setShowUnverified((v) => !v);
       else if (key.name === "n" && key.shift) setView("chains");
+      else if (key.name === "a" && key.shift) setView("all-chains");
       else if (key.name === "n") void toggleMode();
       else if (key.name === "j" || key.name === "down") moveCursor(1);
       else if (key.name === "k" || key.name === "up") moveCursor(-1);
@@ -584,6 +605,7 @@ function App(props: AppProps) {
     // wallets owns its escape so sub-modes (name input, add-choose, etc) can pop one level.
     if (view() === "wallets") return;
     if (view() === "chains") return;
+    if (view() === "all-chains") return;
     if (key.name === "escape") {
       setView("home");
     }
@@ -679,6 +701,14 @@ function App(props: AppProps) {
             setChainId(c.id);
           }}
           onChange={() => setChainsTick((t) => t + 1)}
+          onClose={() => setView("home")}
+        />
+      </Show>
+      <Show when={view() === "all-chains"}>
+        <AllChainsView
+          data={allPortfolio()}
+          loading={allPortfolio.loading}
+          onRefresh={() => setAllPortfolioFresh((n) => n + 1)}
           onClose={() => setView("home")}
         />
       </Show>
@@ -2316,11 +2346,161 @@ function ChainView(props: {
   );
 }
 
+function AllChainsView(props: {
+  data: AllChainsPortfolio | null | undefined;
+  loading: boolean;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [cursor, setCursor] = createSignal(0);
+  const [expanded, setExpanded] = createSignal<Set<number>>(new Set());
+
+  const mainnet = () => props.data?.chains ?? [];
+  const testnets = () => props.data?.testnets ?? [];
+  const errors = () => props.data?.errors ?? [];
+  const rowCount = () => mainnet().length + testnets().length;
+
+  function toggleExpand(chainId: number): void {
+    const next = new Set(expanded());
+    if (next.has(chainId)) next.delete(chainId);
+    else next.add(chainId);
+    setExpanded(next);
+  }
+
+  function selectedChainId(): number | null {
+    const c = cursor();
+    const main = mainnet();
+    if (c < main.length) return main[c]?.chainId ?? null;
+    const t = testnets()[c - main.length];
+    return t?.chainId ?? null;
+  }
+
+  useKeyboard((key) => {
+    if (key.name === "escape") { props.onClose(); return; }
+    if (key.name === "g") { props.onRefresh(); return; }
+    const max = Math.max(0, rowCount() - 1);
+    if (key.name === "j" || key.name === "down") setCursor((c) => Math.min(max, c + 1));
+    else if (key.name === "k" || key.name === "up") setCursor((c) => Math.max(0, c - 1));
+    else if (key.name === "return") {
+      const id = selectedChainId();
+      if (id !== null) toggleExpand(id);
+    }
+  });
+
+  return (
+    <box marginTop={1} flexDirection="column">
+      <box flexDirection="row">
+        <text attributes={1}>All Chains</text>
+        <Show when={props.loading}>
+          <text fg={ROW_COLORS.dim}>  (loading)</text>
+        </Show>
+      </box>
+      <Show when={!props.data && !props.loading}>
+        <text fg={ROW_COLORS.dim} marginTop={1}>  failed to load</text>
+      </Show>
+      <Show when={props.data}>
+        <box marginTop={1} flexDirection="row">
+          <text attributes={1}>{`  TOTAL (mainnet)  `}</text>
+          <text attributes={1} fg={ROW_COLORS.ok}>{fmtUsd(props.data!.mainnetTotalUsd)}</text>
+        </box>
+
+        <Show when={mainnet().length > 0}>
+          <box marginTop={1} flexDirection="column">
+            <For each={mainnet()}>
+              {(p, idx) => {
+                const isSelected = () => cursor() === idx();
+                const isExpanded = () => expanded().has(p.chainId);
+                const chain = getKnownChain(p.chainId);
+                const name = chain?.name ?? `chain ${p.chainId}`;
+                const visibleTokens = p.tokens.filter((t) => !t.spam && !t.unverified);
+                const tokenCount = visibleTokens.length;
+                return (
+                  <>
+                    <box flexDirection="row">
+                      <text fg={isSelected() ? "#3ddc84" : undefined}>
+                        {`  ${isSelected() ? ">" : " "} ${isExpanded() ? "-" : "+"} ${name.padEnd(18)} `}
+                      </text>
+                      <text fg={isSelected() ? "#3ddc84" : ROW_COLORS.ok}>
+                        {fmtUsd(p.totalUsd).padStart(10)}
+                      </text>
+                      <text fg={ROW_COLORS.dim}>{`   ${tokenCount} token${tokenCount === 1 ? "" : "s"}`}</text>
+                    </box>
+                    <Show when={isExpanded()}>
+                      <For each={visibleTokens.slice(0, 8)}>
+                        {(t) => (
+                          <box flexDirection="row">
+                            <text fg={ROW_COLORS.amount}>{`      ${t.symbol.padEnd(8)} `}</text>
+                            <text>{`${fmtTok(t.balance, t.decimals).padStart(14)}  ${fmtUsd(t.usd).padStart(10)}  ${(t.pct ?? 0).toFixed(1)}%`}</text>
+                          </box>
+                        )}
+                      </For>
+                    </Show>
+                  </>
+                );
+              }}
+            </For>
+          </box>
+        </Show>
+
+        <Show when={testnets().length > 0}>
+          <box marginTop={1} flexDirection="column">
+            <text fg={ROW_COLORS.dim}>{`  -- Testnets --`}</text>
+            <For each={testnets()}>
+              {(p, idx) => {
+                const absIdx = () => mainnet().length + idx();
+                const isSelected = () => cursor() === absIdx();
+                const isExpanded = () => expanded().has(p.chainId);
+                const chain = getKnownChain(p.chainId);
+                const name = chain?.name ?? `chain ${p.chainId}`;
+                const native = p.tokens.find((t) => t.token === "native");
+                const tokens = p.tokens.filter((t) => !t.spam);
+                return (
+                  <>
+                    <box flexDirection="row">
+                      <text fg={isSelected() ? "#3ddc84" : undefined}>
+                        {`  ${isSelected() ? ">" : " "} ${isExpanded() ? "-" : "+"} ${name.padEnd(18)} `}
+                      </text>
+                      <text fg={ROW_COLORS.amount}>
+                        {native ? `${fmtTok(native.balance, native.decimals)} ${native.symbol}` : "-"}
+                      </text>
+                    </box>
+                    <Show when={isExpanded()}>
+                      <For each={tokens.slice(0, 8)}>
+                        {(t) => (
+                          <box flexDirection="row">
+                            <text fg={ROW_COLORS.amount}>{`      ${t.symbol.padEnd(8)} `}</text>
+                            <text>{fmtTok(t.balance, t.decimals)}</text>
+                          </box>
+                        )}
+                      </For>
+                    </Show>
+                  </>
+                );
+              }}
+            </For>
+          </box>
+        </Show>
+
+        <Show when={errors().length > 0}>
+          <box marginTop={1} flexDirection="column">
+            <text fg={ROW_COLORS.bad}>{`  -- Errors (${errors().length}) --`}</text>
+            <For each={errors()}>
+              {(e) => (
+                <text fg={ROW_COLORS.bad}>{`  ${e.name.padEnd(18)} ${e.error.slice(0, 50)}`}</text>
+              )}
+            </For>
+          </box>
+        </Show>
+      </Show>
+    </box>
+  );
+}
+
 function FooterHints(props: { view: View; mode?: "overview" | "data" }) {
   const hint = () => {
     switch (props.view) {
       case "home":
-        return "[j/k] move  [enter] detail  [y] copy addr  [s] send  [r] receive  [h] history  [c] connections  [w] wallets  [N] networks  [e] watch  [tab] chain  [shift+tab] wallet  [n] mode  [u] unverified  [g] refresh  [q] quit";
+        return "[j/k] move  [enter] detail  [y] copy addr  [s] send  [r] receive  [h] history  [c] connections  [w] wallets  [N] networks  [A] all chains  [e] watch  [tab] chain  [shift+tab] wallet  [n] mode  [u] unverified  [g] refresh  [q] quit";
       case "send":
         return "tab cycles fields, type to fill, esc back";
       case "receive":
@@ -2335,6 +2515,8 @@ function FooterHints(props: { view: View; mode?: "overview" | "data" }) {
         return "j/k move  enter set default  a add  d remove  D remove+purge  esc back";
       case "chains":
         return "j/k move  enter select  a add  d remove (hot only)  esc back";
+      case "all-chains":
+        return "[j/k] move  [enter] expand  [g] refresh  [esc] back";
       case "tx":
         return props.mode === "data"
           ? "[j/k] scroll  [c] copy bytes  [o] open explorer  [tab] back to overview  [esc] back"

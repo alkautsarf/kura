@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-05-12
+
+### Added
+- All-chains portfolio view (Shift+A from home). Fans `buildPortfolio` across every configured chain (bundled mainnet + known testnets + hot-loaded) via `Promise.allSettled` and renders a unified screen: headline mainnet total USD on top, per-chain rows sorted by total value desc with token expand/collapse on enter, and a separate testnet section showing native balances without dollar values. Errors from individual chains (RPC timeout, etc.) surface at the bottom in red instead of failing the whole view.
+- Daemon `GET /portfolio/all?address=...&wallet=...` endpoint. Caches results 15s in-memory keyed on `(address, wallet)`, busts on any approved transaction via the existing SSE subscriber, supports `?fresh=1` to bypass cache.
+- `buildPortfolioAll(walletName, address)` in `core/portfolio.ts` strips native USD on testnet chains so `priceBySymbol("ETH")` does not leak real ETH price onto Sepolia balances. Token prices on testnets are already null from Alchemy.
+
+### Internal
+- `mergeChains(listHotChains())` reused for enumerating all chains in the aggregator instead of hand-rolling a Map merge.
+
 ## [0.1.20] - 2026-05-02
 
 ### Added
@@ -26,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encodeErc20Transfer(to, amount)` extracted to `core/decode-tx.ts`; CLI and TUI now share one ERC20 transfer encoder.
 - `DEFAULT_HOT_CAPABILITIES` constant + `mergeChains(hot)` helper added to `core/chains.ts` so CLI and TUI add flows can't drift on capability defaults.
 
+[0.1.21]: https://github.com/alkautsarf/kura/releases/tag/v0.1.21
 [0.1.20]: https://github.com/alkautsarf/kura/releases/tag/v0.1.20
 
 ## [0.1.19] - 2026-05-02

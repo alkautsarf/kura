@@ -53,13 +53,15 @@ kura install-shim     # (re)install the qutebrowser userscript
 
 ## TUI keys (home view)
 
-`j`/`k` move cursor on activity rows · `enter` open tx detail · `y` copy wallet address · `s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `N` networks · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
+`j`/`k` move cursor on activity rows · `enter` open tx detail · `y` copy wallet address · `s` send · `r` receive (QR) · `h` history · `c` connections · `w` wallets · `N` networks · `A` all chains · `e` watch · `tab` cycle chain · `shift+tab` cycle wallet · `n` mainnet/testnet toggle · `u` toggle unverified tokens · `g` refresh · `q` quit · `esc` back from any modal
 
 In the tx detail view: `c` copies the hash · `o` opens the explorer · `esc` returns.
 
+In the all-chains view (`Shift+A`): `j`/`k` move · `enter` expand/collapse a chain's tokens · `g` force refresh · `esc` back. Mainnet total USD on top, per-chain rows sorted by value, testnets listed separately with native balances only (no fake USD).
+
 ## Architecture
 
-**Daemon** (`kura daemon`): Bun.serve over HTTPS on `127.0.0.1:8421`, mkcert-issued cert, X-Kura-Key auth, 19 endpoints (`/balance`, `/portfolio`, `/history`, `/requests`, `/simulate`, `/decode`, `/risk`, `/rpc` (read-only allowlist proxy for `eth_blockNumber`, `eth_call`, `eth_estimateGas`, etc.), ...). Spawns approval popups via `tmux display-popup -E -B`. Never holds keys in memory; reads from Keychain only when an approve fires.
+**Daemon** (`kura daemon`): Bun.serve over HTTPS on `127.0.0.1:8421`, mkcert-issued cert, X-Kura-Key auth, 20 endpoints (`/balance`, `/portfolio`, `/portfolio/all`, `/history`, `/requests`, `/simulate`, `/decode`, `/risk`, `/rpc` (read-only allowlist proxy for `eth_blockNumber`, `eth_call`, `eth_estimateGas`, etc.), ...). Spawns approval popups via `tmux display-popup -E -B`. Never holds keys in memory; reads from Keychain only when an approve fires.
 
 **CSP-strip proxy** (`kura proxy`, port 8422): tiny TLS-MITM that intercepts only the dapps that ship a restrictive `<meta http-equiv="Content-Security-Policy">` (Uniswap, OpenSea). Per-host certs signed by your mkcert root CA. Auto-spawned by qutebrowser's `config.py` on startup, dies cleanly with the browser. Daemon-independent — killing the wallet daemon does not break browsing.
 

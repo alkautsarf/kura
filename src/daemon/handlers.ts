@@ -5,7 +5,7 @@ import { loadAllChains, getKnownChain } from "../core/chains.ts";
 import { decide, enqueue, enrich, get, list as listPending } from "./requests.ts";
 import { recentEvents, sseStream, subscribe } from "./events.ts";
 import { readAudit } from "../core/audit-log.ts";
-import { buildPortfolio } from "../core/portfolio.ts";
+import { buildPortfolio, buildPortfolioAll } from "../core/portfolio.ts";
 import { fetchActivity, archiveHead } from "../core/history.ts";
 import { decodeCalldata } from "../core/decode.ts";
 import { describeTx, type SemanticTx } from "../core/decode-tx.ts";
@@ -369,6 +369,7 @@ interface PortfolioCacheEntry { data: unknown; ts: number; }
 interface ActivityCacheEntry { items: unknown; ts: number; archiveHeight: number; }
 const portfolioCache = new Map<string, PortfolioCacheEntry>();
 const activityCache = new Map<string, ActivityCacheEntry>();
+const portfolioAllCache = new Map<string, PortfolioCacheEntry>();
 
 subscribe((event) => {
   // Any tx the user just signed will change balances + activity. Clear both
@@ -376,6 +377,7 @@ subscribe((event) => {
   if (event.type === "request:resolved" && event.payload.decision === "approve") {
     portfolioCache.clear();
     activityCache.clear();
+    portfolioAllCache.clear();
   }
 });
 
@@ -394,6 +396,22 @@ export const handlePortfolio: JsonHandler = async (_req, url) => {
   const portfolio = await buildPortfolio(wallet, chainId, address);
   portfolioCache.set(key, { data: portfolio, ts: Date.now() });
   return json(portfolio);
+};
+
+export const handlePortfolioAll: JsonHandler = async (_req, url) => {
+  const cfg = await getConfig();
+  const wallet = url.searchParams.get("wallet") ?? cfg.defaultWallet;
+  const address = await resolveAddress(url.searchParams.get("address") ?? wallet);
+  if (!address) return badRequest("address/wallet required");
+  const fresh = url.searchParams.get("fresh") === "1";
+  const key = `${address.toLowerCase()}:${wallet}`;
+  if (!fresh) {
+    const cached = portfolioAllCache.get(key);
+    if (cached && Date.now() - cached.ts < TTL_MS) return json(cached.data);
+  }
+  const aggregate = await buildPortfolioAll(wallet, address);
+  portfolioAllCache.set(key, { data: aggregate, ts: Date.now() });
+  return json(aggregate);
 };
 
 export const handleHistory: JsonHandler = async (_req, url) => {

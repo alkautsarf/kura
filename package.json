@@ -1,6 +1,6 @@
 {
   "name": "kura",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "EVM terminal wallet.",
   "type": "module",
   "private": true,

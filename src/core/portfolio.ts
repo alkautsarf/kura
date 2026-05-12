@@ -1,6 +1,6 @@
 import { formatUnits } from "viem";
 import type { Address, Portfolio, PortfolioToken } from "./types.ts";
-import { getKnownChain } from "./chains.ts";
+import { getKnownChain, isTestnet, listHotChains, mergeChains } from "./chains.ts";
 import { nativeBalance, tokenBalances, getSpamContracts } from "./balance.ts";
 import { priceByAddressBatch, priceBySymbol } from "./prices.ts";
 
@@ -57,5 +57,74 @@ export async function buildPortfolio(walletName: string, chainId: number, addres
     chainId,
     totalUsd,
     tokens: all,
+  };
+}
+
+export interface AllChainsPortfolioError {
+  chainId: number;
+  name: string;
+  error: string;
+}
+
+export interface AllChainsPortfolio {
+  walletName: string;
+  address: Address;
+  mainnetTotalUsd: number;
+  chains: Portfolio[];
+  testnets: Portfolio[];
+  errors: AllChainsPortfolioError[];
+}
+
+export async function buildPortfolioAll(walletName: string, address: Address): Promise<AllChainsPortfolio> {
+  const chains = mergeChains(listHotChains());
+
+  const settled = await Promise.allSettled(
+    chains.map((c) => buildPortfolio(walletName, c.id, address)),
+  );
+
+  const okMainnet: Portfolio[] = [];
+  const okTestnet: Portfolio[] = [];
+  const errors: AllChainsPortfolioError[] = [];
+
+  settled.forEach((res, i) => {
+    const chain = chains[i]!;
+    if (res.status === "fulfilled") {
+      const p = res.value;
+      if (isTestnet(chain)) {
+        // Strip native USD on testnets: priceBySymbol returns real ETH price for
+        // Sepolia ETH (and similar), which would inflate a balance with no real
+        // monetary value. Token prices are already null on testnets via Alchemy.
+        const stripped: Portfolio = {
+          ...p,
+          tokens: p.tokens.map((t) =>
+            t.token === "native" ? { ...t, usd: undefined, pct: 0 } : t,
+          ),
+          totalUsd: 0,
+        };
+        okTestnet.push(stripped);
+      } else {
+        okMainnet.push(p);
+      }
+    } else {
+      const reason = res.reason instanceof Error ? res.reason.message : String(res.reason);
+      errors.push({ chainId: chain.id, name: chain.name, error: reason });
+    }
+  });
+
+  okMainnet.sort((a, b) => b.totalUsd - a.totalUsd);
+  const nameByChainId = new Map(chains.map((c) => [c.id, c.name]));
+  okTestnet.sort((a, b) =>
+    (nameByChainId.get(a.chainId) ?? "").localeCompare(nameByChainId.get(b.chainId) ?? ""),
+  );
+
+  const mainnetTotalUsd = okMainnet.reduce((sum, p) => sum + p.totalUsd, 0);
+
+  return {
+    walletName,
+    address,
+    mainnetTotalUsd,
+    chains: okMainnet,
+    testnets: okTestnet,
+    errors,
   };
 }
