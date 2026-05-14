@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-05-14
+
+### Added
+- `kura reset` CLI command to recover from a wedged popup pipeline without restarting qutebrowser. Soft mode (`kura reset`) hits the new auth-gated `POST /requests/reset` endpoint, which auto-rejects every queued entry so in-flight dapp HTTP calls return cleanly, force-clears `currentPopupId` (the slot can wedge when an orphaned `kura popup` process never fires `proc.exited`), then calls `drainQueue()` defensively in case an `enqueue` raced with the snapshot. The CLI follows up with `pkill -f "kura popup"` to nuke any orphan UI process the daemon couldn't see. Preserves daemon, TLS warm state, and SSE streams. Hard mode (`kura reset --hard`) instead runs `launchctl kickstart -k gui/$UID/homebrew.mxcl.kura` for a full daemon restart with a `pkill kura daemon` fallback for non-launchd installs.
+
+### Internal
+- Shared `printDaemonDown(suggestion)` helper in `cli/client.ts` replaces three near-duplicate "daemon not reachable" error blocks across `cli/index.ts`, `commands/reset.ts`, and (still to land) `commands/init.ts`.
+
 ## [0.1.22] - 2026-05-12
 
 ### Fixed
@@ -41,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encodeErc20Transfer(to, amount)` extracted to `core/decode-tx.ts`; CLI and TUI now share one ERC20 transfer encoder.
 - `DEFAULT_HOT_CAPABILITIES` constant + `mergeChains(hot)` helper added to `core/chains.ts` so CLI and TUI add flows can't drift on capability defaults.
 
+[0.1.23]: https://github.com/alkautsarf/kura/releases/tag/v0.1.23
 [0.1.22]: https://github.com/alkautsarf/kura/releases/tag/v0.1.22
 [0.1.21]: https://github.com/alkautsarf/kura/releases/tag/v0.1.21
 [0.1.20]: https://github.com/alkautsarf/kura/releases/tag/v0.1.20

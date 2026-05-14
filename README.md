@@ -45,6 +45,7 @@ kura watch            # live SSE stream of daemon events
 kura wallet list      # manage wallets (also: add | use | remove | show | migrate)
 kura chain list       # manage chains (also: add <id> <rpc> | remove | show)
 kura install-shim     # (re)install the qutebrowser userscript
+kura reset            # clear a stuck popup pipeline (add --hard to restart the daemon too)
 ```
 
 `kura wallet add <name>` accepts `--generate`, `--import-key <hex|->`, `--watch-only <0x...>`, `--default`. Without flags it prompts interactively. `kura wallet use <name>` (alias `switch`) sets the default. `kura wallet remove <name> [--purge-key] [-y]` drops the wallet (and optionally its Keychain entry); the next remaining wallet becomes default.

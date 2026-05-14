@@ -1,6 +1,6 @@
 import mri from "mri";
 import { COLOR } from "./format.ts";
-import { checkDaemon } from "./client.ts";
+import { checkDaemon, printDaemonDown } from "./client.ts";
 import { reloadHotChains } from "../core/chains.ts";
 
 export async function run(argv: string[]): Promise<void> {
@@ -12,12 +12,14 @@ export async function run(argv: string[]): Promise<void> {
 
   await reloadHotChains();
 
-  const NO_DAEMON_NEEDED = new Set(["init", "daemon", "popup", "proxy", "wallet", "chain"]);
+  // `reset` skips the upfront daemon check because the command itself decides
+  // what to do when daemon is unreachable (soft reset surfaces the error and
+  // suggests --hard; --hard restarts via launchctl regardless).
+  const NO_DAEMON_NEEDED = new Set(["init", "daemon", "popup", "proxy", "wallet", "chain", "reset"]);
   if (!NO_DAEMON_NEEDED.has(cmd)) {
     const ok = await checkDaemon();
     if (!ok) {
-      console.error(`${COLOR.red}daemon not reachable${COLOR.reset}`);
-      console.error(`run ${COLOR.bold}kura daemon${COLOR.reset} in another pane first.`);
+      printDaemonDown(`run ${COLOR.bold}kura daemon${COLOR.reset} in another pane first.`);
       process.exit(1);
     }
   }
@@ -101,6 +103,11 @@ export async function run(argv: string[]): Promise<void> {
         const args = mri<any>(rest, { boolean: ["yes"], alias: { y: "yes" } });
         const { run } = await import("./commands/chain.ts");
         return await run({ _: args._, yes: args.yes });
+      }
+      case "reset": {
+        const args = mri<any>(rest, { boolean: ["hard"] });
+        const { run } = await import("./commands/reset.ts");
+        return await run({ hard: args.hard });
       }
       case "init": {
         const args = mri<any>(rest, {

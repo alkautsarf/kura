@@ -2,7 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Address, PendingRequest, RequestKind } from "../core/types.ts";
 import { getConfig, listSessions, listWallets, removeSession, getWallet } from "../core/config.ts";
 import { loadAllChains, getKnownChain } from "../core/chains.ts";
-import { decide, enqueue, enrich, get, list as listPending } from "./requests.ts";
+import { decide, enqueue, enrich, get, list as listPending, reset as resetPending } from "./requests.ts";
 import { recentEvents, sseStream, subscribe } from "./events.ts";
 import { readAudit } from "../core/audit-log.ts";
 import { buildPortfolio, buildPortfolioAll } from "../core/portfolio.ts";
@@ -334,6 +334,12 @@ export const handleRequestDecide: JsonHandler = async (req) => {
   const ok = decide(id, body.decision, { txHash: body.txHash, error: body.error });
   if (!ok) return notFound();
   return json({ ok: true });
+};
+
+export const handleRequestsReset: JsonHandler = async (req) => {
+  if (req.method !== "POST") return badRequest("POST only");
+  const result = resetPending();
+  return json({ ok: true, ...result });
 };
 
 export const handleNotImplemented: JsonHandler = (_req, url) => {

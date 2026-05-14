@@ -36,7 +36,8 @@ async function main() {
     case "watch":
     case "wallet":
     case "chain":
-    case "proxy": {
+    case "proxy":
+    case "reset": {
       const { run: runCli } = await import("./cli/index.ts");
       return runCli(args);
     }
@@ -66,6 +67,7 @@ Usage:
   kura daemon                run as background daemon
   kura proxy                 run csp-strip HTTPS proxy (also auto-started by daemon if enabled in config)
   kura popup <id>            render approval popup (spawned by daemon)
+  kura reset [--hard]        clear stuck popup pipeline (--hard restarts the whole daemon)
 `);
       return;
 

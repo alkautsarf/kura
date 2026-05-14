@@ -120,6 +120,27 @@ export function decide(
   return true;
 }
 
+// Force-clear pending state. Used by `kura reset` to recover from a wedged
+// popup pipeline (e.g., orphan kura-popup process holding currentPopupId set
+// while no popup is visible). Auto-rejects every queued entry so the dapp's
+// in-flight /requests fetches return cleanly, then nulls currentPopupId so
+// the next enqueue can spawn fresh. Does NOT kill the popup processes
+// themselves — the CLI does that externally via pkill so the kill survives
+// even when the daemon is healthy but the popup is the wedge.
+export function reset(): { cleared: number } {
+  const entries = [...queue.values()].filter((e) => !e.resolved);
+  for (const entry of entries) {
+    entry.resolver({ decision: "reject", error: "reset by user" });
+  }
+  currentPopupId = null;
+  emit("request:reset", { cleared: entries.length });
+  // Drain in case a new enqueue raced in after the snapshot but before the
+  // currentPopupId null. Its drainQueue() call would have early-returned
+  // because currentPopupId was still set; we need to retry now.
+  drainQueue();
+  return { cleared: entries.length };
+}
+
 function entrypoint(): string {
   const arg = process.argv[1];
   if (!arg) return "";

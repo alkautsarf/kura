@@ -1,5 +1,6 @@
 import { getConfig } from "../core/config.ts";
 import { getOrCreateSecret } from "../core/secret.ts";
+import { COLOR } from "./format.ts";
 
 let baseUrl: string | null = null;
 let secret: string | null = null;
@@ -70,4 +71,9 @@ export async function checkDaemon(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export function printDaemonDown(suggestion: string): void {
+  console.error(`${COLOR.red}daemon not reachable${COLOR.reset}`);
+  console.error(suggestion);
 }
